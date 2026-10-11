@@ -1,6 +1,7 @@
-[package]
-name = "mmrs"
+[workspace]
+resolver = "3"
+members = ["mmrs", "mmrs-protocol"]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
-
-[dependencies]
