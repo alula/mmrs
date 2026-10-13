@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::extract::ws::Message;
 use mmrs_protocol::EndReason;
 use serde::Serialize;
 
@@ -93,51 +94,77 @@ impl Parking {
     }
 }
 
-/// Numbers sequenced messages and keeps them until the client acknowledges
-/// them, so a RESUME can replay what it missed.
+/// Numbers sequenced messages, JSON and binary alike, and keeps them until
+/// the client acknowledges them, so a RESUME can replay what it missed.
+///
+/// The wire `seq` is 16 bits and wraps; messages are tracked by a running
+/// index, and a `seq_ack` is matched against the indexes still in reach.
 #[derive(Default)]
 pub struct Replay {
-    next: u32,
-    unacked: VecDeque<(u32, String)>,
+    next: u64,
+    unacked: VecDeque<(u64, Message)>,
 }
 
 impl Replay {
-    pub fn encode(&mut self, op: u32, d: impl Serialize) -> String {
-        let seq = self.next;
-        self.next += 1;
+    pub fn encode(&mut self, op: u32, d: impl Serialize) -> Message {
+        let seq = self.next as u16;
+        self.push(Message::Text(payload::encode(op, d, Some(seq)).into()))
+    }
 
-        let text = payload::encode(op, d, Some(seq));
+    pub fn encode_binary(&mut self, op: u8, data: &[u8]) -> Message {
+        let seq = self.next as u16;
+        self.push(Message::Binary(
+            payload::encode_binary(op, data, Some(seq)).into(),
+        ))
+    }
+
+    fn push(&mut self, message: Message) -> Message {
         if self.unacked.len() == MAX_UNACKED {
             self.unacked.pop_front();
         }
-        self.unacked.push_back((seq, text.clone()));
-        text
+        self.unacked.push_back((self.next, message.clone()));
+        self.next += 1;
+        message
     }
 
     pub fn ack(&mut self, seq_ack: i64) {
+        let Some(acked) = self.resolve(seq_ack) else {
+            return;
+        };
         while self
             .unacked
             .front()
-            .is_some_and(|&(seq, _)| i64::from(seq) <= seq_ack)
+            .is_some_and(|&(index, _)| i128::from(index) <= acked)
         {
             self.unacked.pop_front();
         }
     }
 
     /// The messages after `seq_ack`, or `None` if some were already dropped.
-    pub fn after(&self, seq_ack: i64) -> Option<Vec<String>> {
-        let first = self.unacked.front().map_or(self.next, |&(seq, _)| seq);
-        if seq_ack + 1 < i64::from(first) {
-            return None;
-        }
-
+    pub fn after(&self, seq_ack: i64) -> Option<Vec<Message>> {
+        let acked = self.resolve(seq_ack)?;
         let missed = self
             .unacked
             .iter()
-            .filter(|&&(seq, _)| i64::from(seq) > seq_ack)
-            .map(|(_, text)| text.clone())
+            .filter(|&&(index, _)| i128::from(index) > acked)
+            .map(|(_, message)| message.clone())
             .collect();
         Some(missed)
+    }
+
+    /// The index `seq_ack` refers to: the one just before the oldest kept
+    /// message up to the newest sent. `-1` (nothing received) only matches
+    /// while nothing was ever dropped.
+    fn resolve(&self, seq_ack: i64) -> Option<i128> {
+        let oldest = self.unacked.front().map_or(self.next, |&(index, _)| index);
+        let lowest = i128::from(oldest) - 1;
+        let newest = i128::from(self.next) - 1;
+        if seq_ack == -1 {
+            return (lowest == -1).then_some(-1);
+        }
+
+        let seq_ack = u16::try_from(seq_ack).ok()?;
+        (lowest.max(0)..=newest).find(|&index| index as u16 == seq_ack)
     }
 }
 
@@ -145,13 +172,17 @@ impl Replay {
 mod tests {
     use super::*;
 
-    fn seqs(texts: Vec<String>) -> Vec<u64> {
-        texts
+    fn seqs(messages: Vec<Message>) -> Vec<u64> {
+        messages
             .iter()
-            .map(|text| {
-                serde_json::from_str::<serde_json::Value>(text).unwrap()["seq"]
-                    .as_u64()
-                    .unwrap()
+            .map(|message| match message {
+                Message::Text(text) => {
+                    serde_json::from_str::<serde_json::Value>(text).unwrap()["seq"]
+                        .as_u64()
+                        .unwrap()
+                }
+                Message::Binary(data) => u64::from(u16::from_be_bytes([data[0], data[1]])),
+                _ => unreachable!(),
             })
             .collect()
     }
@@ -159,15 +190,16 @@ mod tests {
     #[test]
     fn replays_after_ack() {
         let mut replay = Replay::default();
-        for _ in 0..3 {
-            replay.encode(5, ());
-        }
+        replay.encode(5, ());
+        replay.encode(5, ());
+        replay.encode_binary(25, &[1, 2]);
 
         assert_eq!(seqs(replay.after(-1).unwrap()), [0, 1, 2]);
         replay.ack(0);
         assert_eq!(seqs(replay.after(0).unwrap()), [1, 2]);
         assert_eq!(seqs(replay.after(2).unwrap()), Vec::<u64>::new());
         assert!(replay.after(-1).is_none());
+        assert!(replay.after(3).is_none());
     }
 
     #[test]
@@ -179,5 +211,18 @@ mod tests {
 
         assert!(replay.after(-1).is_none());
         assert_eq!(replay.after(0).unwrap().len(), MAX_UNACKED);
+    }
+
+    #[test]
+    fn seq_wraps_at_u16() {
+        let mut replay = Replay::default();
+        for _ in 0..=u16::MAX as usize + 1 {
+            let message = replay.encode(5, ());
+            replay.ack(seqs(vec![message])[0] as i64);
+        }
+
+        let message = replay.encode_binary(27, &[]);
+        assert_eq!(seqs(vec![message]), [1]);
+        assert_eq!(seqs(replay.after(0).unwrap()), [1]);
     }
 }

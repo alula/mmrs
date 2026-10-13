@@ -12,12 +12,23 @@ pub struct Frame {
     pub d: Value,
 }
 
-pub fn encode(op: u32, d: impl Serialize, seq: Option<u32>) -> String {
+pub fn encode(op: u32, d: impl Serialize, seq: Option<u16>) -> String {
     match seq {
         Some(seq) => serde_json::json!({ "seq": seq, "op": op, "d": d }),
         None => serde_json::json!({ "op": op, "d": d }),
     }
     .to_string()
+}
+
+/// Server binary frames: `seq u16 BE` (v8 only), `op u8`, payload.
+pub fn encode_binary(op: u8, payload: &[u8], seq: Option<u16>) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(3 + payload.len());
+    if let Some(seq) = seq {
+        frame.extend_from_slice(&seq.to_be_bytes());
+    }
+    frame.push(op);
+    frame.extend_from_slice(payload);
+    frame
 }
 
 #[derive(Deserialize)]

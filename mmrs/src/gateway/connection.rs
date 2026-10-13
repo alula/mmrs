@@ -171,7 +171,13 @@ impl Connection {
 
             let text = match message {
                 Some(Ok(Message::Text(text))) => text,
-                Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(Message::Binary(data))) => {
+                    if let Err(end) = self.handle_binary(&data) {
+                        return end;
+                    }
+                    continue;
+                }
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_)) | Err(_)) | None => return End::disconnected(),
             };
             let frame: Frame = match serde_json::from_str(&text) {
@@ -249,6 +255,19 @@ impl Connection {
                 Ok(())
             }
         }
+    }
+
+    /// Client binary frames: `op u8`, payload. Only DAVE uses them.
+    fn handle_binary(&mut self, data: &[u8]) -> Result<(), End> {
+        let Some((&op, payload)) = data.split_first() else {
+            return Err(End::protocol(CloseCode::DecodeError));
+        };
+        if self.session.is_none() {
+            return Err(End::protocol(CloseCode::NotAuthenticated));
+        }
+
+        tracing::trace!(op, len = payload.len(), "ignoring binary op");
+        return Ok(());
     }
 
     async fn identify(&mut self, mut identify: Identify) -> Result<(), End> {
@@ -360,9 +379,9 @@ impl Connection {
         let missed = missed.ok_or_else(|| End::protocol(CloseCode::SessionNoLongerValid))?;
 
         self.send(opcode::RESUMED, Value::Null).await?;
-        for text in missed {
+        for message in missed {
             self.socket
-                .send(Message::Text(text.into()))
+                .send(message)
                 .await
                 .map_err(|_| End::disconnected())?;
         }
@@ -534,14 +553,27 @@ impl Connection {
             .session
             .as_mut()
             .filter(|_| self.version >= 8 && opcode::is_sequenced(op));
-        let text = match session {
+        let message = match session {
             Some(session) => session.replay.encode(op, d),
-            None => payload::encode(op, d, None),
+            None => Message::Text(payload::encode(op, d, None).into()),
         };
 
         return self
             .socket
-            .send(Message::Text(text.into()))
+            .send(message)
+            .await
+            .map_err(|_| End::disconnected());
+    }
+
+    async fn send_binary(&mut self, op: u8, data: &[u8]) -> Result<(), End> {
+        let message = match self.session.as_mut().filter(|_| self.version >= 8) {
+            Some(session) => session.replay.encode_binary(op, data),
+            None => Message::Binary(payload::encode_binary(op, data, None).into()),
+        };
+
+        return self
+            .socket
+            .send(message)
             .await
             .map_err(|_| End::disconnected());
     }
