@@ -3,6 +3,7 @@ mod config;
 mod encryption;
 mod gateway;
 mod media;
+mod mls;
 mod room;
 mod session;
 mod tenant;
