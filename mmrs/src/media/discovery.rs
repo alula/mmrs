@@ -18,6 +18,10 @@ pub struct Discovery;
 
 impl Discovery {
     pub fn parse_request(packet: &[u8]) -> Option<DiscoveryRequest> {
+        if packet[0] >> 6 == 2 {
+            return None;
+        }
+
         // [u16be(0x01), u16be(70)]
         if packet.len() == 74 && (packet[..4] == [0, 0x01, 0, 70]) {
             let ssrc = u32::from_be_bytes(packet[4..8].try_into().unwrap());
