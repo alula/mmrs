@@ -558,7 +558,7 @@ mod tests {
         let remove = sender.remove(&[1; 8], 3, 2);
         let body = proposals_append([remove.message.as_slice()]);
         assert_eq!(body[0], 0);
-        assert_eq!(Reader::new(&body[1..]).vector().unwrap(), remove.message);
+        assert_eq!(TlsReader::new(&body[1..]).vector().unwrap(), remove.message);
 
         let body = proposals_revoke([&remove.reference]);
         let mut reader = TlsReader::new(&body[1..]);

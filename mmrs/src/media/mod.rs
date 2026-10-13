@@ -1,5 +1,6 @@
 mod cipher;
 mod discovery;
+mod rtcp;
 mod rtp;
 mod stun;
 
@@ -8,6 +9,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use tokio::net::UdpSocket;
@@ -16,10 +18,17 @@ use crate::config::Config;
 use crate::encryption::EncryptionMode;
 use crate::media::cipher::Cipher;
 use crate::media::discovery::{Discovery, ProtocolVersion};
+use crate::media::rtcp::ReceiveStats;
 use crate::media::rtp::{Packet, RTCP_HEADER_LEN};
 use crate::room::RoomKey;
 
 const MAX_PACKET: usize = 2048;
+
+/// Discord sends its receiver reports every second.
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
+
+const AUDIO_CLOCK_RATE: u32 = 48_000;
+const VIDEO_CLOCK_RATE: u32 = 90_000;
 
 type PacketBuf = ArrayVec<u8, MAX_PACKET>;
 
@@ -56,6 +65,73 @@ struct LegState {
     addr: Option<SocketAddr>,
     udp: Option<UdpLeg>,
     wants: SinkWants,
+    /// What MMRS received on the leg's media SSRCs, for receiver reports.
+    received: HashMap<u32, ReceiveStats>,
+}
+
+impl LegState {
+    /// The first SSRC is audio; streams follow as media and RTX pairs.
+    fn is_rtx(&self, ssrc: u32) -> bool {
+        let offset = ssrc - self.ssrcs.start;
+        offset != 0 && offset.is_multiple_of(2)
+    }
+
+    fn record_rtp(&mut self, ssrc: u32, plain: &[u8], now: Instant) {
+        if self.is_rtx(ssrc) {
+            return;
+        }
+        let seq = u16::from_be_bytes([plain[2], plain[3]]);
+        let timestamp = u32::from_be_bytes(plain[4..8].try_into().unwrap());
+        let clock_rate = if ssrc == self.ssrcs.start {
+            AUDIO_CLOCK_RATE
+        } else {
+            VIDEO_CLOCK_RATE
+        };
+        self.received
+            .entry(ssrc)
+            .and_modify(|stats| stats.record(seq, timestamp, now))
+            .or_insert_with(|| ReceiveStats::new(clock_rate, seq, timestamp, now));
+    }
+
+    /// Discord reports audio with the client's audio SSRC as sender and
+    /// video with the first video SSRC.
+    fn receiver_reports(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let audio = self.ssrcs.start;
+        let mut ssrcs: Vec<u32> = self.received.keys().copied().collect();
+        ssrcs.sort_unstable();
+        let (audio_blocks, video_blocks): (Vec<_>, Vec<_>) = ssrcs
+            .into_iter()
+            .map(|ssrc| {
+                (
+                    ssrc,
+                    self.received
+                        .get_mut(&ssrc)
+                        .unwrap()
+                        .report_block(ssrc, now),
+                )
+            })
+            .partition(|&(ssrc, _)| ssrc == audio);
+
+        let mut compound = Vec::new();
+        for (sender, blocks) in [(audio, audio_blocks), (audio + 1, video_blocks)] {
+            if !blocks.is_empty() {
+                let blocks: Vec<_> = blocks.into_iter().map(|(_, block)| block).collect();
+                rtcp::write_rr(&mut compound, sender, &blocks);
+            }
+        }
+        (!compound.is_empty()).then_some(compound)
+    }
+
+    /// Encrypts `plain` for this leg's client, if it has a key and an
+    /// address yet.
+    fn seal(&mut self, plain: &[u8], header_len: usize) -> Option<(PacketBuf, SocketAddr)> {
+        let (Some(addr), Some(udp)) = (self.addr, &mut self.udp) else {
+            return None;
+        };
+        let sealed = udp.cipher.seal(plain, header_len, udp.n4)?;
+        udp.n4 = udp.n4.wrapping_add(1);
+        Some((sealed, addr))
+    }
 }
 
 /// What a client wants to receive (op 15). A quality of 0 means "do not
@@ -195,32 +271,117 @@ impl Media {
         let Some(plain) = authenticate(legs, sender_id, packet, header_len, from) else {
             return;
         };
-        let Some(members) = rooms.get(&legs[&sender_id].room) else {
+        let sender = legs.get_mut(&sender_id).expect("indexed leg exists");
+        sender.record_rtp(ssrc, &plain, Instant::now());
+        let Some(members) = rooms.get(&sender.room) else {
             return;
         };
 
+        self.fan_out(legs, members, sender_id, ssrc, &plain, header_len);
+    }
+
+    /// Sends `plain` to every other member of the room that wants `ssrc`.
+    fn fan_out(
+        &self,
+        legs: &mut HashMap<u64, LegState>,
+        members: &HashSet<u64>,
+        sender_id: u64,
+        ssrc: u32,
+        plain: &[u8],
+        header_len: usize,
+    ) {
         for &id in members.iter().filter(|&&id| id != sender_id) {
             let leg = legs.get_mut(&id).expect("room member exists");
             if !leg.wants.wants(ssrc) {
                 continue;
             }
-            let (Some(addr), Some(udp)) = (leg.addr, &mut leg.udp) else {
-                continue;
-            };
-            let Some(sealed) = udp.cipher.seal(&plain, header_len, udp.n4) else {
-                continue;
-            };
-            udp.n4 = udp.n4.wrapping_add(1);
-            self.send(&sealed, addr);
+            if let Some((sealed, addr)) = leg.seal(plain, header_len) {
+                self.send(&sealed, addr);
+            }
         }
     }
 
+    /// RTCP is terminated per leg: sender reports go on to receivers
+    /// without their report blocks, NACK and PLI go to the leg that owns
+    /// the media SSRC, everything else stops here.
     fn receive_rtcp(&self, ssrc: u32, packet: &[u8], from: SocketAddr) {
-        let mut legs = self.legs.lock().unwrap();
-        let Some(&id) = legs.by_ssrc.get(&ssrc) else {
+        let mut guard = self.legs.lock().unwrap();
+        let Legs {
+            legs,
+            by_ssrc,
+            rooms,
+            ..
+        } = &mut *guard;
+
+        let Some(&sender_id) = by_ssrc.get(&ssrc) else {
             return;
         };
-        authenticate(&mut legs.legs, id, packet, RTCP_HEADER_LEN, from);
+        let Some(plain) = authenticate(legs, sender_id, packet, RTCP_HEADER_LEN, from) else {
+            return;
+        };
+        let room = legs[&sender_id].room.clone();
+        let now = Instant::now();
+
+        for packet in rtcp::packets(&plain) {
+            match (rtcp::packet_type(packet), rtcp::count(packet)) {
+                (rtcp::SR, _) => {
+                    let Some(ssrc) = rtcp::sender_ssrc(packet)
+                        .filter(|ssrc| by_ssrc.get(ssrc) == Some(&sender_id))
+                    else {
+                        continue;
+                    };
+                    let (Some(ntp_middle), Some(stripped)) = (
+                        rtcp::sr_ntp_middle(packet),
+                        rtcp::strip_report_blocks(packet),
+                    ) else {
+                        continue;
+                    };
+                    let sender = legs.get_mut(&sender_id).expect("indexed leg exists");
+                    if let Some(stats) = sender.received.get_mut(&ssrc) {
+                        stats.record_sr(ntp_middle, now);
+                    }
+                    if let Some(members) = rooms.get(&room) {
+                        self.fan_out(legs, members, sender_id, ssrc, &stripped, RTCP_HEADER_LEN);
+                    }
+                }
+                (rtcp::RTPFB, rtcp::FMT_NACK) | (rtcp::PSFB, rtcp::FMT_PLI) => {
+                    let Some(&owner_id) =
+                        rtcp::media_ssrc(packet).and_then(|ssrc| by_ssrc.get(&ssrc))
+                    else {
+                        continue;
+                    };
+                    let owner = legs.get_mut(&owner_id).expect("indexed leg exists");
+                    if owner_id == sender_id || owner.room != room {
+                        continue;
+                    }
+                    if let Some((sealed, addr)) = owner.seal(packet, RTCP_HEADER_LEN) {
+                        self.send(&sealed, addr);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub async fn report(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(REPORT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            self.send_reports(Instant::now());
+        }
+    }
+
+    fn send_reports(&self, now: Instant) {
+        let mut legs = self.legs.lock().unwrap();
+        for leg in legs.legs.values_mut() {
+            let Some(compound) = leg.receiver_reports(now) else {
+                continue;
+            };
+            if let Some((sealed, addr)) = leg.seal(&compound, RTCP_HEADER_LEN) {
+                self.send(&sealed, addr);
+            }
+        }
     }
 
     fn ice_binding(&self, packet: &[u8], from: SocketAddr) -> Option<Vec<u8>> {
@@ -262,6 +423,7 @@ impl Media {
                 addr: None,
                 udp: None,
                 wants: SinkWants::default(),
+                received: HashMap::new(),
             },
         );
 
@@ -475,8 +637,15 @@ mod tests {
         buf[..len].to_vec()
     }
 
-    #[tokio::test]
-    async fn forwards_rtp_between_udp_legs() {
+    struct Client {
+        leg: Leg,
+        cipher: Cipher,
+        socket: UdpSocket,
+    }
+
+    /// A running media plane with `count` UDP clients in one room, past IP
+    /// discovery.
+    async fn clients(count: usize) -> (Arc<Media>, Vec<Client>) {
         let media = Media::bind(&config()).await.unwrap();
         let port = media.socket.local_addr().unwrap().port();
         tokio::spawn(media.clone().run());
@@ -485,14 +654,11 @@ mod tests {
             tenant: "t".into(),
             room: "r".into(),
         };
-        let a = media.open_leg(room.clone(), 3);
-        let b = media.open_leg(room, 3);
         let mode = EncryptionMode::AeadAes256GcmRtpsize;
-        let a_cipher = Cipher::new(mode, &a.select_udp(mode));
-        let b_cipher = Cipher::new(mode, &b.select_udp(mode));
-
-        let mut sockets = Vec::new();
-        for leg in [&a, &b] {
+        let mut clients = Vec::new();
+        for _ in 0..count {
+            let leg = media.open_leg(room.clone(), 3);
+            let cipher = Cipher::new(mode, &leg.select_udp(mode));
             let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
             socket.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
 
@@ -501,21 +667,95 @@ mod tests {
             request[4..8].copy_from_slice(&leg.first_ssrc().to_be_bytes());
             socket.send(&request).await.unwrap();
             assert_eq!(recv(&socket).await[..2], [0, 2]);
-            sockets.push(socket);
+            clients.push(Client {
+                leg,
+                cipher,
+                socket,
+            });
         }
+        (media, clients)
+    }
+
+    fn audio(ssrc: u32, seq: u16) -> Vec<u8> {
+        let mut rtp = vec![0x80, 0x78];
+        rtp.extend_from_slice(&seq.to_be_bytes());
+        rtp.extend_from_slice(&(u32::from(seq) * 960).to_be_bytes());
+        rtp.extend_from_slice(&ssrc.to_be_bytes());
+        rtp.extend_from_slice(&[0xf8, 0xff, 0xfe]);
+        rtp
+    }
+
+    #[tokio::test]
+    async fn forwards_rtp_between_udp_legs() {
+        let (_media, clients) = clients(2).await;
+        let [a, b] = &clients[..] else { unreachable!() };
 
         let ping = [0x13, 0x37, 0xca, 0xfe, 1, 0, 0, 0];
-        sockets[0].send(&ping).await.unwrap();
-        assert_eq!(recv(&sockets[0]).await, ping);
+        a.socket.send(&ping).await.unwrap();
+        assert_eq!(recv(&a.socket).await, ping);
 
-        let mut rtp = vec![0x80, 0x78, 0, 1, 0, 0, 0x03, 0xc0];
-        rtp.extend_from_slice(&a.first_ssrc().to_be_bytes());
-        rtp.extend_from_slice(&[0xf8, 0xff, 0xfe]);
-        let sealed = a_cipher.seal(&rtp, 12, 7).unwrap();
-        sockets[0].send(&sealed).await.unwrap();
+        let rtp = audio(a.leg.first_ssrc(), 1);
+        a.socket
+            .send(&a.cipher.seal(&rtp, 12, 7).unwrap())
+            .await
+            .unwrap();
 
-        let forwarded = recv(&sockets[1]).await;
+        let forwarded = recv(&b.socket).await;
         assert_eq!(forwarded[forwarded.len() - 4..], [0, 0, 0, 0]);
-        assert_eq!(b_cipher.open(&forwarded, 12).unwrap().as_slice(), rtp);
+        assert_eq!(b.cipher.open(&forwarded, 12).unwrap().as_slice(), rtp);
+    }
+
+    #[tokio::test]
+    async fn terminates_rtcp_per_leg() {
+        let (media, clients) = clients(2).await;
+        let [a, b] = &clients[..] else { unreachable!() };
+        let (a_ssrc, b_ssrc) = (a.leg.first_ssrc(), b.leg.first_ssrc());
+
+        for (n4, seq) in [(0, 1), (1, 3)] {
+            let rtp = audio(a_ssrc, seq);
+            a.socket
+                .send(&a.cipher.seal(&rtp, 12, n4).unwrap())
+                .await
+                .unwrap();
+            recv(&b.socket).await;
+        }
+
+        // SR with one report block, then SDES.
+        let mut compound = vec![0x81, 0xc8, 0x00, 0x0c];
+        compound.extend_from_slice(&a_ssrc.to_be_bytes());
+        compound.extend((8..52).map(|i| i as u8));
+        compound.extend_from_slice(&[0x81, 0xca, 0x00, 0x01]);
+        compound.extend_from_slice(&a_ssrc.to_be_bytes());
+        a.socket
+            .send(&a.cipher.seal(&compound, 8, 2).unwrap())
+            .await
+            .unwrap();
+
+        let sr = b.cipher.open(&recv(&b.socket).await, 8).unwrap();
+        assert_eq!(sr[..4], [0x80, 0xc8, 0x00, 0x06]);
+        assert_eq!(sr[4..], compound[4..28]);
+
+        let mut pli = vec![0x81, 0xce, 0x00, 0x02];
+        pli.extend_from_slice(&b_ssrc.to_be_bytes());
+        pli.extend_from_slice(&a_ssrc.to_be_bytes());
+        b.socket
+            .send(&b.cipher.seal(&pli, 8, 0).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            a.cipher.open(&recv(&a.socket).await, 8).unwrap().as_slice(),
+            pli
+        );
+
+        media.send_reports(Instant::now());
+        let rr = a.cipher.open(&recv(&a.socket).await, 8).unwrap();
+        assert_eq!(rr[..4], [0x81, 0xc9, 0x00, 0x07]);
+        assert_eq!(
+            rr[4..12],
+            [a_ssrc.to_be_bytes(), a_ssrc.to_be_bytes()].concat()
+        );
+        assert_eq!(rr[12..16], [85, 0, 0, 1]);
+        assert_eq!(rr[16..20], 3u32.to_be_bytes());
+        assert_eq!(rr[24..28], [0x0a, 0x0b, 0x0c, 0x0d]);
     }
 }

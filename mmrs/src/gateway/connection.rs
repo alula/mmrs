@@ -169,6 +169,10 @@ impl Connection {
                 }
             };
 
+            if let Some(Ok(message)) = message.as_ref() {
+                self.log_message("<~", message);
+            }
+
             let text = match message {
                 Some(Ok(Message::Text(text))) => text,
                 Some(Ok(Message::Binary(data))) => {
@@ -266,7 +270,6 @@ impl Connection {
             return Err(End::protocol(CloseCode::NotAuthenticated));
         }
 
-        tracing::trace!(op, len = payload.len(), "ignoring binary op");
         return Ok(());
     }
 
@@ -557,6 +560,7 @@ impl Connection {
             Some(session) => session.replay.encode(op, d),
             None => Message::Text(payload::encode(op, d, None).into()),
         };
+        self.log_message("~>", &message);
 
         return self
             .socket
@@ -570,12 +574,25 @@ impl Connection {
             Some(session) => session.replay.encode_binary(op, data),
             None => Message::Binary(payload::encode_binary(op, data, None).into()),
         };
+        self.log_message("~>", &message);
 
         return self
             .socket
             .send(message)
             .await
             .map_err(|_| End::disconnected());
+    }
+
+    fn log_message(&self, prefix: &str, message: &Message) {
+        match message {
+            Message::Text(text) => {
+                tracing::trace!("{} {}", prefix, text.as_str());
+            }
+            Message::Binary(data) => {
+                tracing::trace!("{} binary {} bytes", prefix, data.len());
+            }
+            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {}
+        }
     }
 }
 
