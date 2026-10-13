@@ -2,7 +2,8 @@ mod discovery;
 mod stun;
 
 use std::collections::{HashMap, HashSet};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
@@ -12,6 +13,8 @@ use crate::media::discovery::{Discovery, ProtocolVersion};
 /// The media UDP socket. Native clients and browsers share it, as on Discord.
 pub struct Media {
     socket: UdpSocket,
+    /// SSRCs are unique per node, across tenants.
+    next_ssrc: AtomicU32,
     /// SSRCs handed out in READY; IP discovery is answered only for these.
     ssrcs: Mutex<HashSet<u32>>,
     /// Local ICE ufrag to credentials of a webrtc session.
@@ -33,6 +36,7 @@ impl Media {
         tracing::info!(bind = %socket.local_addr()?, "media socket listening");
         Ok(Arc::new(Self {
             socket,
+            next_ssrc: AtomicU32::new(100),
             ssrcs: Mutex::default(),
             ice: Mutex::default(),
         }))
@@ -96,11 +100,13 @@ impl Media {
         ))
     }
 
-    pub fn lease_ssrc(self: &Arc<Self>, ssrc: u32) -> SsrcLease {
-        self.ssrcs.lock().unwrap().insert(ssrc);
+    pub fn lease_ssrcs(self: &Arc<Self>, count: u32) -> SsrcLease {
+        let first = allocate(&self.next_ssrc, count);
+        let range = first..first + count;
+        self.ssrcs.lock().unwrap().extend(range.clone());
         SsrcLease {
             media: self.clone(),
-            ssrc,
+            range,
         }
     }
 
@@ -130,12 +136,21 @@ impl Media {
 
 pub struct SsrcLease {
     media: Arc<Media>,
-    ssrc: u32,
+    range: Range<u32>,
+}
+
+impl SsrcLease {
+    pub fn first(&self) -> u32 {
+        self.range.start
+    }
 }
 
 impl Drop for SsrcLease {
     fn drop(&mut self) {
-        self.media.ssrcs.lock().unwrap().remove(&self.ssrc);
+        let mut ssrcs = self.media.ssrcs.lock().unwrap();
+        for ssrc in self.range.clone() {
+            ssrcs.remove(&ssrc);
+        }
     }
 }
 
@@ -160,4 +175,27 @@ fn ice_chars(count: usize) -> String {
         .iter()
         .map(|b| char::from(ALPHABET[usize::from(b % 64)]))
         .collect()
+}
+
+fn allocate(next: &AtomicU32, count: u32) -> u32 {
+    loop {
+        let first = next.fetch_add(count, Ordering::Relaxed);
+
+        if first != 0 && first.checked_add(count).is_some() {
+            return first;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssrc_blocks_skip_zero() {
+        let next = AtomicU32::new(u32::MAX - 1);
+        let first = allocate(&next, 3);
+
+        assert!(first >= 1 && first.checked_add(3).is_some());
+    }
 }

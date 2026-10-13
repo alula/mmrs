@@ -39,7 +39,7 @@ struct Session {
     conn_id: u64,
     info: SessionRef,
     replaced: oneshot::Receiver<()>,
-    _ssrc: SsrcLease,
+    _ssrcs: SsrcLease,
     transport: Option<Transport>,
 }
 
@@ -234,10 +234,11 @@ impl Connection {
             session_id: ticket.session_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
-        let ssrc = self
+        let ssrcs = self
             .state
-            .ssrcs
-            .allocate(1 + 2 * identify.streams.len() as u32);
+            .media
+            .lease_ssrcs(1 + 2 * identify.streams.len() as u32);
+        let ready = self.ready(ssrcs.first(), identify.streams);
 
         let info = SessionRef {
             user_id: ticket.user_id,
@@ -252,7 +253,7 @@ impl Connection {
             conn_id: registration.conn_id,
             info: info.clone(),
             replaced: registration.replaced,
-            _ssrc: self.state.media.lease_ssrc(ssrc),
+            _ssrcs: ssrcs,
             transport: None,
         });
 

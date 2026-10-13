@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::oneshot;
 
@@ -62,32 +62,6 @@ impl Sessions {
     }
 }
 
-/// SSRCs are unique per node, across tenants.
-pub struct SsrcAllocator {
-    next: AtomicU32,
-}
-
-impl SsrcAllocator {
-    pub fn new() -> Self {
-        let start = 32192;
-
-        return Self {
-            next: AtomicU32::new(start),
-        };
-    }
-
-    /// Returns the first of `count` consecutive SSRCs, none of them 0.
-    pub fn allocate(&self, count: u32) -> u32 {
-        loop {
-            let first = self.next.fetch_add(count, Ordering::Relaxed);
-
-            if first != 0 && first.checked_add(count - 1).is_some() {
-                return first;
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,15 +84,5 @@ mod tests {
         sessions.unregister(&key(), first.conn_id);
         let _third = sessions.register(key());
         assert!(second.replaced.try_recv().is_ok());
-    }
-
-    #[test]
-    fn ssrc_blocks_skip_zero() {
-        let allocator = SsrcAllocator {
-            next: AtomicU32::new(u32::MAX - 1),
-        };
-        let first = allocator.allocate(3);
-
-        assert!(first >= 1 && first.checked_add(2).is_some());
     }
 }
