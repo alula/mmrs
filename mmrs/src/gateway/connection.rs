@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,15 +6,19 @@ use axum::extract::ws::{Message, WebSocket};
 use mmrs_protocol::{EndReason, Event, SessionRef, TicketResponse, VoiceToken};
 use serde::Serialize;
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
 
 use super::close::CloseCode;
-use super::payload::{self, Frame, Identify, SelectProtocol, StreamRequest, UdpProtocolData};
+use super::payload::{
+    self, ClientSpeaking, Frame, Identify, SelectProtocol, SpeakingState, StreamRequest,
+    UdpProtocolData,
+};
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
 use crate::media::{IceLease, SsrcLease};
+use crate::room::{Membership, Push, RoomKey, Speaking};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
 
@@ -38,8 +42,15 @@ struct Session {
     conn_id: u64,
     info: SessionRef,
     replaced: oneshot::Receiver<()>,
+    membership: Membership,
+    pushes: mpsc::UnboundedReceiver<Push>,
     _ssrcs: SsrcLease,
     transport: Option<Transport>,
+}
+
+enum Signal {
+    Replaced,
+    Push(Push),
 }
 
 enum Transport {
@@ -134,10 +145,19 @@ impl Connection {
                 _ = sleep_until(identify_deadline), if !identified => {
                     return End::protocol(CloseCode::NotAuthenticated);
                 }
-                _ = replaced(&mut self.session) => {
-                    return End::new(CloseCode::Disconnected, EndReason::Replaced);
-                }
-                _ = shutdown.wait_for(|stop| *stop) => {
+                signal = session_signal(&mut self.session) => match signal {
+                    Signal::Replaced => {
+                        return End::new(CloseCode::Disconnected, EndReason::Replaced);
+                    }
+                    Signal::Push(push) => {
+                        if let Err(end) = self.push(push).await {
+                            return end;
+                        }
+                        continue;
+                    }
+                },
+                // Drops the watch guard, which is not Send, before an arm awaits.
+                _ = async { shutdown.wait_for(|stop| *stop).await.is_ok() } => {
                     return End::new(CloseCode::ServerCrash, EndReason::NodeShutdown);
                 }
             };
@@ -182,6 +202,14 @@ impl Connection {
                 self.select_protocol(select).await
             }
             opcode::SPEAKING => {
+                let speaking: ClientSpeaking = serde_json::from_value(frame.d)
+                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                if let Some(session) = &self.session {
+                    session.membership.set_speaking(Speaking {
+                        ssrc: speaking.ssrc,
+                        flags: speaking.speaking.flags(),
+                    });
+                }
                 Ok(())
             }
             opcode::VOICE_BACKEND_VERSION => {
@@ -242,6 +270,14 @@ impl Connection {
             .media
             .lease_ssrcs(1 + 2 * identify.streams.len() as u32);
         let ready = self.ready(ssrcs.first(), identify.streams);
+        let (membership, pushes) = self.state.rooms.join(
+            RoomKey {
+                tenant: self.tenant.name.clone(),
+                room: ticket.room.clone(),
+            },
+            registration.conn_id,
+            ticket.user_id.clone(),
+        );
 
         let info = SessionRef {
             user_id: ticket.user_id,
@@ -256,11 +292,12 @@ impl Connection {
             conn_id: registration.conn_id,
             info: info.clone(),
             replaced: registration.replaced,
+            membership,
+            pushes,
             _ssrcs: ssrcs,
             transport: None,
         });
 
-        let ready = self.ready(ssrc, identify.streams);
         self.send(opcode::READY, ready).await?;
         self.tenant
             .publish(&Event::SessionStarted {
@@ -273,7 +310,7 @@ impl Connection {
     }
 
     fn ready(&self, ssrc: u32, mut streams: Vec<StreamRequest>) -> payload::Ready {
-        let config = &self.state.config;
+        let media = &self.state.media;
 
         // Discord assigns SSRCs to simulcast layers lowest quality first.
         streams.sort_by_key(|stream| stream.quality.unwrap_or(100));
@@ -292,9 +329,9 @@ impl Connection {
 
         return payload::Ready {
             ssrc,
-            ip: self.media_ip().to_string(),
-            port: config.media_port,
-            modes: config.encryption_modes.clone(),
+            ip: media.ip_for(self.client_addr).to_string(),
+            port: media.port(),
+            modes: self.state.config.encryption_modes.clone(),
             streams,
             experiments: Vec::new(),
         };
@@ -365,45 +402,63 @@ impl Connection {
     ) -> Result<Transport, End> {
         let ice = self.state.media.lease_ice();
 
-        description.sdp = Some(self.sdp_answer(&ice));
+        description.sdp = Some(ice.sdp_answer(self.state.media.ip_for(self.client_addr)));
 
         return Ok(Transport::WebRtc { _ice: ice });
     }
 
-    /// The transport-only template the web client builds its remote
-    /// description from.
-    fn sdp_answer(&self, ice: &IceLease) -> String {
-        let ip = self.media_ip();
-        let port = self.state.config.media_port;
-        let family = match ip {
-            IpAddr::V4(_) => "IP4",
-            IpAddr::V6(_) => "IP6",
-        };
+    async fn push(&mut self, push: Push) -> Result<(), End> {
+        match push {
+            Push::Connected(peers) => {
+                let user_ids = peers.iter().map(|peer| peer.user_id.as_str()).collect();
+                self.send(
+                    opcode::CLIENTS_CONNECT,
+                    payload::ClientsConnect { user_ids },
+                )
+                .await?;
 
-        return format!(
-            "m=audio {port} ICE/SDP\n\
-             c=IN {family} {ip}\n\
-             a=rtcp:{port}\n\
-             a=ice-ufrag:{ufrag}\n\
-             a=ice-pwd:{pwd}\n\
-             a=fingerprint:sha-256 {DTLS_FINGERPRINT_PLACEHOLDER}\n\
-             a=candidate:1 1 UDP 2130706431 {ip} {port} typ host\n",
-            ufrag = ice.ufrag,
-            pwd = ice.password,
-        );
+                for peer in &peers {
+                    let user_id = peer.user_id.as_str();
+                    if let Some(speaking) = peer.speaking {
+                        self.send_speaking(user_id, speaking).await?;
+                    }
+                    self.send(
+                        opcode::CLIENT_FLAGS,
+                        payload::ClientFlags {
+                            user_id,
+                            flags: None,
+                        },
+                    )
+                    .await?;
+                    self.send(
+                        opcode::PLATFORM,
+                        payload::Platform {
+                            user_id,
+                            platform: None,
+                        },
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            Push::Disconnected { user_id } => {
+                self.send(
+                    opcode::CLIENT_DISCONNECT,
+                    payload::ClientDisconnect { user_id: &user_id },
+                )
+                .await
+            }
+            Push::Speaking { user_id, speaking } => self.send_speaking(&user_id, speaking).await,
+        }
     }
 
-    fn media_ip(&self) -> IpAddr {
-        let config = &self.state.config;
-        let client_is_v6 = match self.client_addr.ip() {
-            IpAddr::V6(ip) => ip.to_ipv4_mapped().is_none(),
-            IpAddr::V4(_) => false,
+    async fn send_speaking(&mut self, user_id: &str, speaking: Speaking) -> Result<(), End> {
+        let payload = payload::Speaking {
+            user_id,
+            ssrc: speaking.ssrc,
+            speaking: SpeakingState::for_version(self.version, speaking.flags),
         };
-
-        match config.media_ipv6 {
-            Some(ipv6) if config.enable_ipv6 && client_is_v6 => IpAddr::V6(ipv6),
-            _ => IpAddr::V4(config.media_ipv4),
-        }
+        self.send(opcode::SPEAKING, payload).await
     }
 
     async fn send(&mut self, op: u32, d: impl Serialize) -> Result<(), End> {
@@ -421,14 +476,16 @@ impl Connection {
     }
 }
 
-async fn replaced(session: &mut Option<Session>) {
-    if let Some(session) = session
-        && (&mut session.replaced).await.is_ok()
-    {
-        return;
-    }
+async fn session_signal(session: &mut Option<Session>) -> Signal {
+    let Some(session) = session else {
+        return std::future::pending().await;
+    };
 
-    return std::future::pending().await;
+    tokio::select! {
+        Ok(()) = &mut session.replaced => Signal::Replaced,
+        Some(push) = session.pushes.recv() => Signal::Push(push),
+        else => std::future::pending().await,
+    }
 }
 
 fn random<const N: usize>() -> [u8; N] {

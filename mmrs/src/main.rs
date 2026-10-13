@@ -3,6 +3,7 @@ mod config;
 mod encryption;
 mod gateway;
 mod media;
+mod room;
 mod session;
 mod tenant;
 mod tls;
@@ -21,7 +22,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
 use media::Media;
-use session::{Sessions, SsrcAllocator};
+use room::Rooms;
+use session::Sessions;
 use tenant::Tenants;
 
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -30,7 +32,7 @@ pub struct AppState {
     pub config: Config,
     pub tenants: Tenants,
     pub sessions: Sessions,
-    pub ssrcs: SsrcAllocator,
+    pub rooms: Arc<Rooms>,
     pub media: Arc<Media>,
     pub shutdown: watch::Receiver<bool>,
     /// Dropped with the last connection, which closes the drain channel in `main`.
@@ -52,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .map(|tls| tls::load(&tls.cert, &tls.key))
         .transpose()?;
 
-    let media = Media::bind(config.media_port).await?;
+    let media = Media::bind(&config).await?;
     tokio::spawn(media.clone().run());
 
     let tenants = Tenants::connect(&config.tenants, &config.node_id).await?;
@@ -65,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         tenants,
         sessions: Sessions::default(),
-        ssrcs: SsrcAllocator::new(),
+        rooms: Arc::default(),
         media,
         shutdown: shutdown_rx.clone(),
         _alive: alive_tx,

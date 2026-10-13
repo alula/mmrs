@@ -2,17 +2,24 @@ mod discovery;
 mod stun;
 
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::net::UdpSocket;
 
+use crate::config::Config;
 use crate::media::discovery::{Discovery, ProtocolVersion};
+
+const DTLS_FINGERPRINT_PLACEHOLDER: &str = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
 
 /// The media UDP socket. Native clients and browsers share it, as on Discord.
 pub struct Media {
     socket: UdpSocket,
+    ipv4: Ipv4Addr,
+    ipv6: Option<Ipv6Addr>,
+    port: u16,
     /// SSRCs are unique per node, across tenants.
     next_ssrc: AtomicU32,
     /// SSRCs handed out in READY; IP discovery is answered only for these.
@@ -27,7 +34,8 @@ struct IceEntry {
 }
 
 impl Media {
-    pub async fn bind(port: u16) -> anyhow::Result<Arc<Self>> {
+    pub async fn bind(config: &Config) -> anyhow::Result<Arc<Self>> {
+        let port = config.media_port;
         // `[::]` is dual-stack unless net.ipv6.bindv6only is set.
         let socket = match UdpSocket::bind((Ipv6Addr::UNSPECIFIED, port)).await {
             Ok(socket) => socket,
@@ -36,10 +44,25 @@ impl Media {
         tracing::info!(bind = %socket.local_addr()?, "media socket listening");
         Ok(Arc::new(Self {
             socket,
+            ipv4: config.media_ipv4,
+            ipv6: config.media_ipv6.filter(|_| config.enable_ipv6),
+            port,
             next_ssrc: AtomicU32::new(100),
             ssrcs: Mutex::default(),
             ice: Mutex::default(),
         }))
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// The address to hand a client that reached the gateway from `client`.
+    pub fn ip_for(&self, client: SocketAddr) -> IpAddr {
+        match (self.ipv6, client.ip().to_canonical()) {
+            (Some(ipv6), IpAddr::V6(_)) => IpAddr::V6(ipv6),
+            _ => IpAddr::V4(self.ipv4),
+        }
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -158,6 +181,30 @@ pub struct IceLease {
     media: Arc<Media>,
     pub ufrag: String,
     pub password: String,
+}
+
+impl IceLease {
+    /// The transport-only template the web client builds its remote
+    /// description from.
+    pub fn sdp_answer(&self, ip: IpAddr) -> String {
+        let port = self.media.port;
+        let family = match ip {
+            IpAddr::V4(_) => "IP4",
+            IpAddr::V6(_) => "IP6",
+        };
+
+        return format!(
+            "m=audio {port} ICE/SDP\n\
+             c=IN {family} {ip}\n\
+             a=rtcp:{port}\n\
+             a=ice-ufrag:{ufrag}\n\
+             a=ice-pwd:{pwd}\n\
+             a=fingerprint:sha-256 {DTLS_FINGERPRINT_PLACEHOLDER}\n\
+             a=candidate:1 1 UDP 2130706431 {ip} {port} typ host\n",
+            ufrag = self.ufrag,
+            pwd = self.password,
+        );
+    }
 }
 
 impl Drop for IceLease {
