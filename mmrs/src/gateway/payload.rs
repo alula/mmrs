@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -100,6 +102,15 @@ pub struct SessionDescription {
     pub secret_key: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdp: Option<String>,
+}
+
+/// Keys are `any` or an SSRC in decimal, values a quality from 0 to 100.
+/// Other keys (`pixelCounts`) are ignored.
+#[derive(Deserialize)]
+pub struct MediaSinkWants {
+    pub any: Option<u8>,
+    #[serde(flatten)]
+    pub ssrcs: HashMap<String, Value>,
 }
 
 #[derive(Serialize)]

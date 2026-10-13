@@ -17,7 +17,7 @@ use super::payload::{
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
-use crate::media::{IceLease, Leg};
+use crate::media::{IceLease, Leg, SinkWants};
 use crate::room::{Membership, Push, RoomKey, Speaking};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
@@ -212,6 +212,14 @@ impl Connection {
                 }
                 Ok(())
             }
+            opcode::MEDIA_SINK_WANTS => {
+                let wants: payload::MediaSinkWants = serde_json::from_value(frame.d)
+                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                if let Some(session) = &self.session {
+                    session.leg.set_wants(sink_wants(wants));
+                }
+                Ok(())
+            }
             opcode::VOICE_BACKEND_VERSION => {
                 let version = concat!("mmrs ", env!("CARGO_PKG_VERSION"));
                 let reply = payload::BackendVersion {
@@ -373,7 +381,12 @@ impl Connection {
             session.transport = Some(transport);
         }
 
-        return self.send(opcode::SESSION_DESCRIPTION, description).await;
+        self.send(opcode::SESSION_DESCRIPTION, description).await?;
+        if self.version >= 5 {
+            self.send(opcode::MEDIA_SINK_WANTS, serde_json::json!({ "any": 100 }))
+                .await?;
+        }
+        return Ok(());
     }
 
     fn select_transport_udp(
@@ -491,6 +504,22 @@ async fn session_signal(session: &mut Option<Session>) -> Signal {
     }
 }
 
+fn sink_wants(wants: payload::MediaSinkWants) -> SinkWants {
+    let ssrcs = wants
+        .ssrcs
+        .iter()
+        .filter_map(|(ssrc, quality)| {
+            let quality = u8::try_from(quality.as_u64()?).ok()?;
+            Some((ssrc.parse().ok()?, quality))
+        })
+        .collect();
+
+    SinkWants {
+        any: wants.any.unwrap_or(100),
+        ssrcs,
+    }
+}
+
 fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
     getrandom::fill(&mut bytes).expect("system RNG");
@@ -512,8 +541,23 @@ fn heartbeat_ack(version: u8, d: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::heartbeat_ack;
+    use super::{heartbeat_ack, sink_wants};
     use serde_json::json;
+
+    #[test]
+    fn sink_wants_from_browser() {
+        let wants = serde_json::from_value(json!({
+            "44346": 100,
+            "any": 0,
+            "pixelCounts": {"20218": 0},
+        }))
+        .unwrap();
+        let wants = sink_wants(wants);
+
+        assert_eq!(wants.any, 0);
+        assert_eq!(wants.ssrcs.len(), 1);
+        assert_eq!(wants.ssrcs[&44346], 100);
+    }
 
     #[test]
     fn heartbeat_ack_per_version() {

@@ -55,6 +55,29 @@ struct LegState {
     /// moved by authenticated packets, since native clients rotate sockets.
     addr: Option<SocketAddr>,
     udp: Option<UdpLeg>,
+    wants: SinkWants,
+}
+
+/// What a client wants to receive (op 15). A quality of 0 means "do not
+/// forward"; browsers start from `any: 0` and list each stream they want.
+pub struct SinkWants {
+    pub any: u8,
+    pub ssrcs: HashMap<u32, u8>,
+}
+
+impl Default for SinkWants {
+    fn default() -> Self {
+        Self {
+            any: 100,
+            ssrcs: HashMap::new(),
+        }
+    }
+}
+
+impl SinkWants {
+    fn wants(&self, ssrc: u32) -> bool {
+        self.ssrcs.get(&ssrc).copied().unwrap_or(self.any) > 0
+    }
 }
 
 struct UdpLeg {
@@ -178,6 +201,9 @@ impl Media {
 
         for &id in members.iter().filter(|&&id| id != sender_id) {
             let leg = legs.get_mut(&id).expect("room member exists");
+            if !leg.wants.wants(ssrc) {
+                continue;
+            }
             let (Some(addr), Some(udp)) = (leg.addr, &mut leg.udp) else {
                 continue;
             };
@@ -235,6 +261,7 @@ impl Media {
                 ssrcs: ssrcs.clone(),
                 addr: None,
                 udp: None,
+                wants: SinkWants::default(),
             },
         );
 
@@ -312,6 +339,13 @@ impl Leg {
             n4: 0,
         });
         key
+    }
+}
+
+impl Leg {
+    pub fn set_wants(&self, wants: SinkWants) {
+        let mut legs = self.media.legs.lock().unwrap();
+        legs.legs.get_mut(&self.id).expect("open leg exists").wants = wants;
     }
 }
 
@@ -394,6 +428,18 @@ fn allocate(next: &AtomicU32, count: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sink_wants_default_to_any() {
+        let wants = SinkWants {
+            any: 0,
+            ssrcs: HashMap::from([(7, 100), (8, 0)]),
+        };
+        assert!(wants.wants(7));
+        assert!(!wants.wants(8));
+        assert!(!wants.wants(9));
+        assert!(SinkWants::default().wants(9));
+    }
 
     #[test]
     fn ssrc_blocks_skip_zero() {
