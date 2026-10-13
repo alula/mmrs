@@ -35,6 +35,17 @@ pub struct Identify {
 }
 
 #[derive(Deserialize)]
+pub struct Resume {
+    #[serde(deserialize_with = "id")]
+    pub server_id: String,
+    pub session_id: String,
+    pub token: String,
+    /// -1 when nothing was received yet.
+    #[serde(default)]
+    pub seq_ack: Option<i64>,
+}
+
+#[derive(Deserialize)]
 pub struct StreamRequest {
     pub rid: Option<String>,
     pub quality: Option<u8>,

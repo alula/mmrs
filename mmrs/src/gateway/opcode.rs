@@ -7,6 +7,7 @@ pub const SPEAKING: u32 = 5;
 pub const HEARTBEAT_ACK: u32 = 6;
 pub const RESUME: u32 = 7;
 pub const HELLO: u32 = 8;
+pub const RESUMED: u32 = 9;
 pub const CLIENTS_CONNECT: u32 = 11;
 pub const CLIENT_DISCONNECT: u32 = 13;
 pub const MEDIA_SINK_WANTS: u32 = 15;

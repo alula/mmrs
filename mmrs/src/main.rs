@@ -21,6 +21,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
+use gateway::Parking;
 use media::Media;
 use room::Rooms;
 use session::Sessions;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub tenants: Tenants,
     pub sessions: Sessions,
     pub rooms: Arc<Rooms>,
+    pub parking: Parking,
     pub media: Arc<Media>,
     pub shutdown: watch::Receiver<bool>,
     /// Dropped with the last connection, which closes the drain channel in `main`.
@@ -68,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
         tenants,
         sessions: Sessions::default(),
         rooms: Arc::default(),
+        parking: Parking::default(),
         media,
         shutdown: shutdown_rx.clone(),
         _alive: alive_tx,

@@ -2,6 +2,7 @@ mod close;
 mod connection;
 mod opcode;
 mod payload;
+mod resume;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use serde::Deserialize;
 use crate::AppState;
 use close::CloseCode;
 use connection::Connection;
+pub use resume::Parking;
 
 /// Discord answers HELLO with 8 to clients requesting 9 or 10.
 const MAX_VERSION: u8 = 8;

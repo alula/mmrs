@@ -11,9 +11,10 @@ use tokio::time::{Instant, sleep_until};
 
 use super::close::CloseCode;
 use super::payload::{
-    self, ClientSpeaking, Frame, Identify, SelectProtocol, SpeakingState, StreamRequest,
+    self, ClientSpeaking, Frame, Identify, Resume, SelectProtocol, SpeakingState, StreamRequest,
     UdpProtocolData,
 };
+use super::resume::{ParkKey, Parking, Replay};
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
@@ -34,18 +35,21 @@ pub struct Connection {
     version: u8,
     client_addr: SocketAddr,
     session: Option<Session>,
-    seq: u32,
 }
 
-struct Session {
+/// Outlives its WebSocket while parked for a resume.
+pub struct Session {
     key: SessionKey,
     conn_id: u64,
-    info: SessionRef,
+    pub info: SessionRef,
+    /// The IDENTIFY token, which a RESUME must repeat.
+    pub token: String,
     replaced: oneshot::Receiver<()>,
     membership: Membership,
     pushes: mpsc::UnboundedReceiver<Push>,
     leg: Leg,
     transport: Option<Transport>,
+    replay: Replay,
 }
 
 enum Signal {
@@ -81,6 +85,13 @@ impl End {
             reason: EndReason::ClientDisconnected,
         }
     }
+
+    fn resumable(&self) -> bool {
+        matches!(
+            self.reason,
+            EndReason::ClientDisconnected | EndReason::HeartbeatTimeout
+        )
+    }
 }
 
 impl Connection {
@@ -98,7 +109,6 @@ impl Connection {
             version,
             client_addr,
             session: None,
-            seq: 0,
         }
     }
 
@@ -108,17 +118,14 @@ impl Connection {
         if let Some(code) = end.close {
             let _ = self.socket.send(close_message(code)).await;
         }
-        if let Some(session) = self.session.take() {
-            self.state
-                .sessions
-                .unregister(&session.key, session.conn_id);
-            self.tenant
-                .publish(&Event::SessionEnded {
-                    node_id: self.state.config.node_id.clone(),
-                    session: session.info,
-                    reason: end.reason,
-                })
-                .await;
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Clients only resume once they have a SESSION_DESCRIPTION.
+        if end.resumable() && session.transport.is_some() {
+            Parking::park(&self.state, self.tenant.clone(), session, end.reason);
+        } else {
+            end_session(&self.state, &self.tenant, session, end.reason).await;
         }
     }
 
@@ -183,10 +190,15 @@ impl Connection {
     async fn handle(&mut self, frame: Frame) -> Result<(), End> {
         match frame.op {
             opcode::HEARTBEAT => {
+                if let Some(session) = &mut self.session
+                    && let Some(seq_ack) = frame.d.get("seq_ack").and_then(Value::as_i64)
+                {
+                    session.replay.ack(seq_ack);
+                }
                 self.send(opcode::HEARTBEAT_ACK, heartbeat_ack(self.version, frame.d))
                     .await
             }
-            opcode::IDENTIFY if self.session.is_some() => {
+            opcode::IDENTIFY | opcode::RESUME if self.session.is_some() => {
                 Err(End::protocol(CloseCode::AlreadyAuthenticated))
             }
             opcode::IDENTIFY => {
@@ -194,7 +206,11 @@ impl Connection {
                     .map_err(|_| End::protocol(CloseCode::DecodeError))?;
                 self.identify(identify).await
             }
-            opcode::RESUME => Err(End::protocol(CloseCode::SessionNoLongerValid)),
+            opcode::RESUME => {
+                let resume = serde_json::from_value(frame.d)
+                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                self.resume(resume).await
+            }
             _ if self.session.is_none() => Err(End::protocol(CloseCode::NotAuthenticated)),
             opcode::SELECT_PROTOCOL => {
                 let select = serde_json::from_value(frame.d)
@@ -273,6 +289,10 @@ impl Connection {
             session_id: ticket.session_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
+        let parked = self.state.parking.take(&ParkKey {
+            tenant: self.tenant.name.clone(),
+            session_id: ticket.session_id.clone(),
+        });
         let room = RoomKey {
             tenant: self.tenant.name.clone(),
             room: ticket.room.clone(),
@@ -286,6 +306,10 @@ impl Connection {
             self.state
                 .rooms
                 .join(room, registration.conn_id, ticket.user_id.clone());
+        // After the join, so peers never see this user leave.
+        if let Some(old) = parked {
+            end_session(&self.state, &self.tenant, old, EndReason::Replaced).await;
+        }
 
         let info = SessionRef {
             user_id: ticket.user_id,
@@ -299,11 +323,13 @@ impl Connection {
             key,
             conn_id: registration.conn_id,
             info: info.clone(),
+            token: identify.token,
             replaced: registration.replaced,
             membership,
             pushes,
             leg,
             transport: None,
+            replay: Replay::default(),
         });
 
         self.send(opcode::READY, ready).await?;
@@ -314,6 +340,32 @@ impl Connection {
             })
             .await;
 
+        return Ok(());
+    }
+
+    async fn resume(&mut self, resume: Resume) -> Result<(), End> {
+        let key = ParkKey {
+            tenant: self.tenant.name.clone(),
+            session_id: resume.session_id,
+        };
+        let session = self
+            .state
+            .parking
+            .claim(&key, &resume.token, &resume.server_id)
+            .ok_or_else(|| End::protocol(CloseCode::SessionNoLongerValid))?;
+
+        let missed = session.replay.after(resume.seq_ack.unwrap_or(-1));
+        // Holding the session ends it through `run` if the replay fails.
+        self.session = Some(session);
+        let missed = missed.ok_or_else(|| End::protocol(CloseCode::SessionNoLongerValid))?;
+
+        self.send(opcode::RESUMED, Value::Null).await?;
+        for text in missed {
+            self.socket
+                .send(Message::Text(text.into()))
+                .await
+                .map_err(|_| End::disconnected())?;
+        }
         return Ok(());
     }
 
@@ -478,18 +530,32 @@ impl Connection {
     }
 
     async fn send(&mut self, op: u32, d: impl Serialize) -> Result<(), End> {
-        let seq = (self.version >= 8 && opcode::is_sequenced(op)).then(|| {
-            let seq = self.seq;
-            self.seq += 1;
-            seq
-        });
+        let session = self
+            .session
+            .as_mut()
+            .filter(|_| self.version >= 8 && opcode::is_sequenced(op));
+        let text = match session {
+            Some(session) => session.replay.encode(op, d),
+            None => payload::encode(op, d, None),
+        };
 
         return self
             .socket
-            .send(Message::Text(payload::encode(op, d, seq).into()))
+            .send(Message::Text(text.into()))
             .await
             .map_err(|_| End::disconnected());
     }
+}
+
+pub async fn end_session(state: &AppState, tenant: &Tenant, session: Session, reason: EndReason) {
+    state.sessions.unregister(&session.key, session.conn_id);
+    tenant
+        .publish(&Event::SessionEnded {
+            node_id: state.config.node_id.clone(),
+            session: session.info,
+            reason,
+        })
+        .await;
 }
 
 async fn session_signal(session: &mut Option<Session>) -> Signal {
