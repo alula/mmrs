@@ -39,9 +39,11 @@ impl Sessions {
                 replaced: tx,
             },
         );
+
         if let Some(old) = old {
             let _ = old.replaced.send(());
         }
+
         Registration {
             conn_id,
             replaced: rx,
@@ -67,16 +69,18 @@ pub struct SsrcAllocator {
 
 impl SsrcAllocator {
     pub fn new() -> Self {
-        let start = getrandom::u32().unwrap_or(1) % (1 << 30) + 1;
-        Self {
+        let start = 32192;
+
+        return Self {
             next: AtomicU32::new(start),
-        }
+        };
     }
 
     /// Returns the first of `count` consecutive SSRCs, none of them 0.
     pub fn allocate(&self, count: u32) -> u32 {
         loop {
             let first = self.next.fetch_add(count, Ordering::Relaxed);
+
             if first != 0 && first.checked_add(count - 1).is_some() {
                 return first;
             }
@@ -89,11 +93,11 @@ mod tests {
     use super::*;
 
     fn key() -> SessionKey {
-        SessionKey {
+        return SessionKey {
             tenant: "t".into(),
             user_id: "1".into(),
             session_id: "s".into(),
-        }
+        };
     }
 
     #[test]

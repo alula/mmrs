@@ -2,6 +2,7 @@ mod announce;
 mod config;
 mod encryption;
 mod gateway;
+mod media;
 mod session;
 mod tenant;
 mod tls;
@@ -19,6 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use config::Config;
+use media::Media;
 use session::{Sessions, SsrcAllocator};
 use tenant::Tenants;
 
@@ -29,6 +31,7 @@ pub struct AppState {
     pub tenants: Tenants,
     pub sessions: Sessions,
     pub ssrcs: SsrcAllocator,
+    pub media: Arc<Media>,
     pub shutdown: watch::Receiver<bool>,
     /// Dropped with the last connection, which closes the drain channel in `main`.
     _alive: mpsc::Sender<()>,
@@ -49,6 +52,9 @@ async fn main() -> anyhow::Result<()> {
         .map(|tls| tls::load(&tls.cert, &tls.key))
         .transpose()?;
 
+    let media = Media::bind(config.media_port).await?;
+    tokio::spawn(media.clone().run());
+
     let tenants = Tenants::connect(&config.tenants, &config.node_id).await?;
     let bind = config.voice_bind;
 
@@ -60,6 +66,7 @@ async fn main() -> anyhow::Result<()> {
         tenants,
         sessions: Sessions::default(),
         ssrcs: SsrcAllocator::new(),
+        media,
         shutdown: shutdown_rx.clone(),
         _alive: alive_tx,
     });

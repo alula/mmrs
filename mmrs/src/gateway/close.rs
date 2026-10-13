@@ -8,8 +8,10 @@ pub enum CloseCode {
     SessionNoLongerValid = 4006,
     SessionTimeout = 4009,
     ServerNotFound = 4011,
+    UnknownProtocol = 4012,
     Disconnected = 4014,
     ServerCrash = 4015,
+    UnknownEncryptionMode = 4016,
     BadRequest = 4020,
 }
 
@@ -23,8 +25,10 @@ impl CloseCode {
             Self::SessionNoLongerValid => "Session no longer valid",
             Self::SessionTimeout => "Session timeout",
             Self::ServerNotFound => "Server not found",
+            Self::UnknownProtocol => "Unknown protocol",
             Self::Disconnected => "Disconnected",
             Self::ServerCrash => "Voice server crashed",
+            Self::UnknownEncryptionMode => "Unknown encryption mode",
             Self::BadRequest => "Bad request",
         }
     }

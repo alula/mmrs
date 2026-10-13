@@ -34,20 +34,29 @@ pub async fn handler(
     let requested = match query.v.as_deref().map(str::parse::<u8>) {
         None => 1,
         Some(Ok(v)) => v,
-        Some(Err(_)) => return (StatusCode::BAD_REQUEST, "invalid gateway version").into_response(),
+        Some(Err(_)) => {
+            return (StatusCode::BAD_REQUEST, "invalid gateway version").into_response();
+        }
     };
+
     if requested < state.config.min_gateway_version {
         return (StatusCode::BAD_REQUEST, "gateway version too old").into_response();
     }
 
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or_default();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
     let tenant = state.tenants.by_host(host);
 
     ws.on_upgrade(move |mut socket| async move {
         match tenant {
             Some(tenant) => {
                 let version = requested.min(MAX_VERSION);
-                Connection::new(socket, state, tenant, version, client_addr).run().await;
+
+                Connection::new(socket, state, tenant, version, client_addr)
+                    .run()
+                    .await;
             }
             None => {
                 let _ = socket.send(close_message(CloseCode::ServerNotFound)).await;
@@ -57,5 +66,8 @@ pub async fn handler(
 }
 
 fn close_message(code: CloseCode) -> Message {
-    Message::Close(Some(CloseFrame { code: code as u16, reason: code.reason().into() }))
+    Message::Close(Some(CloseFrame {
+        code: code as u16,
+        reason: code.reason().into(),
+    }))
 }

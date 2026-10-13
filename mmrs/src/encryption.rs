@@ -12,7 +12,10 @@ pub enum EncryptionMode {
 }
 
 impl EncryptionMode {
-    pub const DEFAULT: &[Self] = &[Self::AeadAes256GcmRtpsize, Self::AeadXChaCha20Poly1305Rtpsize];
+    pub const DEFAULT: &[Self] = &[
+        Self::AeadAes256GcmRtpsize,
+        Self::AeadXChaCha20Poly1305Rtpsize,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -27,10 +30,14 @@ impl FromStr for EncryptionMode {
     type Err = UnknownEncryptionMode;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        [Self::AeadAes256GcmRtpsize, Self::AeadXChaCha20Poly1305Rtpsize, Self::Plain]
-            .into_iter()
-            .find(|mode| mode.as_str() == s)
-            .ok_or_else(|| UnknownEncryptionMode(s.to_owned()))
+        [
+            Self::AeadAes256GcmRtpsize,
+            Self::AeadXChaCha20Poly1305Rtpsize,
+            Self::Plain,
+        ]
+        .into_iter()
+        .find(|mode| mode.as_str() == s)
+        .ok_or_else(|| UnknownEncryptionMode(s.to_owned()))
     }
 }
 

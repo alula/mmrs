@@ -61,6 +61,43 @@ pub struct ReadyStream {
     pub active: bool,
 }
 
+#[derive(Deserialize)]
+pub struct SelectProtocol {
+    pub protocol: String,
+    #[serde(default)]
+    pub data: Value,
+    #[serde(default)]
+    pub codecs: Vec<Codec>,
+}
+
+#[derive(Deserialize)]
+pub struct Codec {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub priority: i64,
+}
+
+#[derive(Deserialize)]
+pub struct UdpProtocolData {
+    pub mode: String,
+}
+
+#[derive(Serialize)]
+pub struct SessionDescription {
+    pub audio_codec: &'static str,
+    pub video_codec: String,
+    pub media_session_id: String,
+    pub dave_protocol_version: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<EncryptionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<[u8; 32]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sdp: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct BackendVersion {
     pub voice: &'static str,
@@ -85,11 +122,11 @@ impl From<RawId> for String {
 }
 
 fn id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
-    RawId::deserialize(deserializer).map(String::from)
+    return RawId::deserialize(deserializer).map(String::from);
 }
 
 fn optional_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-    Ok(Option::<RawId>::deserialize(deserializer)?.map(String::from))
+    return Ok(Option::<RawId>::deserialize(deserializer)?.map(String::from));
 }
 
 #[cfg(test)]
@@ -105,6 +142,7 @@ mod tests {
             "token": "7f3a9c1e5b2d8046",
         }))
         .unwrap();
+
         assert_eq!(identify.user_id, "123456789012345678");
         assert_eq!(identify.channel_id, None);
         assert!(identify.streams.is_empty());

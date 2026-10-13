@@ -10,9 +10,11 @@ use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
 
 use super::close::CloseCode;
-use super::payload::{self, Frame, Identify, StreamRequest};
+use super::payload::{self, Frame, Identify, SelectProtocol, StreamRequest, UdpProtocolData};
 use super::{close_message, opcode};
 use crate::AppState;
+use crate::encryption::EncryptionMode;
+use crate::media::{IceLease, SsrcLease};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
 
@@ -20,6 +22,8 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(13_750);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2 * 13_750 + 5_000);
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STREAMS: usize = 4;
+
+const DTLS_FINGERPRINT_PLACEHOLDER: &str = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
 
 pub struct Connection {
     socket: WebSocket,
@@ -35,6 +39,13 @@ struct Session {
     conn_id: u64,
     info: SessionRef,
     replaced: oneshot::Receiver<()>,
+    _ssrc: SsrcLease,
+    transport: Option<Transport>,
+}
+
+enum Transport {
+    Udp,
+    WebRtc { _ice: IceLease },
 }
 
 struct End {
@@ -44,7 +55,10 @@ struct End {
 
 impl End {
     fn new(close: CloseCode, reason: EndReason) -> Self {
-        Self { close: Some(close), reason }
+        Self {
+            close: Some(close),
+            reason,
+        }
     }
 
     fn protocol(close: CloseCode) -> Self {
@@ -52,7 +66,10 @@ impl End {
     }
 
     fn disconnected() -> Self {
-        Self { close: None, reason: EndReason::ClientDisconnected }
+        Self {
+            close: None,
+            reason: EndReason::ClientDisconnected,
+        }
     }
 }
 
@@ -64,7 +81,14 @@ impl Connection {
         version: u8,
         client_addr: SocketAddr,
     ) -> Self {
-        Self { socket, state, tenant, version, client_addr, session: None }
+        Self {
+            socket,
+            state,
+            tenant,
+            version,
+            client_addr,
+            session: None,
+        }
     }
 
     pub async fn run(mut self) {
@@ -74,7 +98,9 @@ impl Connection {
             let _ = self.socket.send(close_message(code)).await;
         }
         if let Some(session) = self.session.take() {
-            self.state.sessions.unregister(&session.key, session.conn_id);
+            self.state
+                .sessions
+                .unregister(&session.key, session.conn_id);
             self.tenant
                 .publish(&Event::SessionEnded {
                     node_id: self.state.config.node_id.clone(),
@@ -86,7 +112,10 @@ impl Connection {
     }
 
     async fn serve(&mut self) -> End {
-        let hello = payload::Hello { v: self.version, heartbeat_interval: HEARTBEAT_INTERVAL.as_millis() as u64 };
+        let hello = payload::Hello {
+            v: self.version,
+            heartbeat_interval: HEARTBEAT_INTERVAL.as_millis() as u64,
+        };
         if let Err(end) = self.send(opcode::HELLO, hello).await {
             return end;
         }
@@ -133,17 +162,31 @@ impl Connection {
 
     async fn handle(&mut self, frame: Frame) -> Result<(), End> {
         match frame.op {
-            opcode::HEARTBEAT => self.send(opcode::HEARTBEAT_ACK, heartbeat_ack(self.version, frame.d)).await,
-            opcode::IDENTIFY if self.session.is_some() => Err(End::protocol(CloseCode::AlreadyAuthenticated)),
+            opcode::HEARTBEAT => {
+                self.send(opcode::HEARTBEAT_ACK, heartbeat_ack(self.version, frame.d))
+                    .await
+            }
+            opcode::IDENTIFY if self.session.is_some() => {
+                Err(End::protocol(CloseCode::AlreadyAuthenticated))
+            }
             opcode::IDENTIFY => {
-                let identify = serde_json::from_value(frame.d).map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let identify = serde_json::from_value(frame.d)
+                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
                 self.identify(identify).await
             }
             opcode::RESUME => Err(End::protocol(CloseCode::SessionNoLongerValid)),
             _ if self.session.is_none() => Err(End::protocol(CloseCode::NotAuthenticated)),
+            opcode::SELECT_PROTOCOL => {
+                let select = serde_json::from_value(frame.d)
+                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                self.select_protocol(select).await
+            }
             opcode::VOICE_BACKEND_VERSION => {
                 let version = concat!("mmrs ", env!("CARGO_PKG_VERSION"));
-                let reply = payload::BackendVersion { voice: version, rtc_worker: version };
+                let reply = payload::BackendVersion {
+                    voice: version,
+                    rtc_worker: version,
+                };
                 self.send(opcode::VOICE_BACKEND_VERSION, reply).await
             }
             op => {
@@ -153,7 +196,7 @@ impl Connection {
         }
     }
 
-    async fn identify(&mut self, identify: Identify) -> Result<(), End> {
+    async fn identify(&mut self, mut identify: Identify) -> Result<(), End> {
         let auth_failed = || End::protocol(CloseCode::AuthenticationFailed);
         let token = VoiceToken::parse(&identify.token).ok_or_else(auth_failed)?;
 
@@ -166,20 +209,23 @@ impl Connection {
             }
         };
 
-        // Clients before gateway v9 do not send `channel_id`.
-        let channel_matches = match (&ticket.channel_id, &identify.channel_id) {
-            (Some(expected), Some(sent)) => expected == sent,
-            _ => true,
-        };
         if ticket.user_id != identify.user_id
             || ticket.session_id != identify.session_id
             || ticket.server_id != identify.server_id
-            || !channel_matches
         {
             return Err(auth_failed());
         }
+
         if identify.streams.len() > MAX_STREAMS {
             return Err(End::protocol(CloseCode::BadRequest));
+        }
+
+        // Discord hands out a placeholder video stream even with `video: false`.
+        if identify.streams.is_empty() {
+            identify.streams.push(StreamRequest {
+                rid: Some(String::new()),
+                quality: Some(0),
+            });
         }
 
         let key = SessionKey {
@@ -188,6 +234,11 @@ impl Connection {
             session_id: ticket.session_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
+        let ssrc = self
+            .state
+            .ssrcs
+            .allocate(1 + 2 * identify.streams.len() as u32);
+
         let info = SessionRef {
             user_id: ticket.user_id,
             session_id: ticket.session_id,
@@ -195,24 +246,30 @@ impl Connection {
             channel_id: identify.channel_id.or(ticket.channel_id),
             room: ticket.room,
         };
+
         self.session = Some(Session {
             key,
             conn_id: registration.conn_id,
             info: info.clone(),
             replaced: registration.replaced,
+            _ssrc: self.state.media.lease_ssrc(ssrc),
+            transport: None,
         });
 
-        let ready = self.ready(identify.streams);
+        let ready = self.ready(ssrc, identify.streams);
         self.send(opcode::READY, ready).await?;
         self.tenant
-            .publish(&Event::SessionStarted { node_id: self.state.config.node_id.clone(), session: info })
+            .publish(&Event::SessionStarted {
+                node_id: self.state.config.node_id.clone(),
+                session: info,
+            })
             .await;
-        Ok(())
+
+        return Ok(());
     }
 
-    fn ready(&self, mut streams: Vec<StreamRequest>) -> payload::Ready {
+    fn ready(&self, ssrc: u32, mut streams: Vec<StreamRequest>) -> payload::Ready {
         let config = &self.state.config;
-        let ssrc = self.state.ssrcs.allocate(1 + 2 * streams.len() as u32);
 
         // Discord assigns SSRCs to simulcast layers lowest quality first.
         streams.sort_by_key(|stream| stream.quality.unwrap_or(100));
@@ -229,14 +286,107 @@ impl Connection {
             })
             .collect();
 
-        payload::Ready {
+        return payload::Ready {
             ssrc,
             ip: self.media_ip().to_string(),
             port: config.media_port,
             modes: config.encryption_modes.clone(),
             streams,
             experiments: Vec::new(),
+        };
+    }
+
+    async fn select_protocol(&mut self, select: SelectProtocol) -> Result<(), End> {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.transport.is_some())
+        {
+            tracing::debug!("ignoring repeated select protocol");
+            return Ok(());
         }
+
+        let video_codec = select
+            .codecs
+            .iter()
+            .filter(|codec| codec.kind == "video")
+            .min_by_key(|codec| codec.priority)
+            .map_or_else(|| "H264".to_owned(), |codec| codec.name.clone());
+
+        let mut description = payload::SessionDescription {
+            audio_codec: "opus",
+            video_codec,
+            media_session_id: hex(&random::<16>()),
+            dave_protocol_version: 0,
+            mode: None,
+            secret_key: None,
+            sdp: None,
+        };
+
+        let transport = match select.protocol.as_str() {
+            "udp" => self.select_transport_udp(select, &mut description)?,
+            "webrtc" => self.select_transport_webrtc(&mut description)?,
+            _ => return Err(End::protocol(CloseCode::UnknownProtocol)),
+        };
+        if let Some(session) = &mut self.session {
+            session.transport = Some(transport);
+        }
+
+        return self.send(opcode::SESSION_DESCRIPTION, description).await;
+    }
+
+    fn select_transport_udp(
+        &self,
+        select: SelectProtocol,
+        description: &mut payload::SessionDescription,
+    ) -> Result<Transport, End> {
+        let data: UdpProtocolData = serde_json::from_value(select.data)
+            .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+        let mode = data
+            .mode
+            .parse::<EncryptionMode>()
+            .ok()
+            .filter(|mode| self.state.config.encryption_modes.contains(mode))
+            .ok_or_else(|| End::protocol(CloseCode::UnknownEncryptionMode))?;
+
+        description.mode = Some(mode);
+        description.secret_key = Some(random());
+
+        return Ok(Transport::Udp);
+    }
+
+    fn select_transport_webrtc(
+        &self,
+        description: &mut payload::SessionDescription,
+    ) -> Result<Transport, End> {
+        let ice = self.state.media.lease_ice();
+
+        description.sdp = Some(self.sdp_answer(&ice));
+
+        return Ok(Transport::WebRtc { _ice: ice });
+    }
+
+    /// The transport-only template the web client builds its remote
+    /// description from.
+    fn sdp_answer(&self, ice: &IceLease) -> String {
+        let ip = self.media_ip();
+        let port = self.state.config.media_port;
+        let family = match ip {
+            IpAddr::V4(_) => "IP4",
+            IpAddr::V6(_) => "IP6",
+        };
+
+        return format!(
+            "m=audio {port} ICE/SDP\n\
+             c=IN {family} {ip}\n\
+             a=rtcp:{port}\n\
+             a=ice-ufrag:{ufrag}\n\
+             a=ice-pwd:{pwd}\n\
+             a=fingerprint:sha-256 {DTLS_FINGERPRINT_PLACEHOLDER}\n\
+             a=candidate:1 1 UDP 2130706431 {ip} {port} typ host\n",
+            ufrag = ice.ufrag,
+            pwd = ice.password,
+        );
     }
 
     fn media_ip(&self) -> IpAddr {
@@ -245,6 +395,7 @@ impl Connection {
             IpAddr::V6(ip) => ip.to_ipv4_mapped().is_none(),
             IpAddr::V4(_) => false,
         };
+
         match config.media_ipv6 {
             Some(ipv6) if config.enable_ipv6 && client_is_v6 => IpAddr::V6(ipv6),
             _ => IpAddr::V4(config.media_ipv4),
@@ -252,7 +403,11 @@ impl Connection {
     }
 
     async fn send(&mut self, op: u32, d: impl Serialize) -> Result<(), End> {
-        self.socket.send(Message::Text(payload::encode(op, d).into())).await.map_err(|_| End::disconnected())
+        return self
+            .socket
+            .send(Message::Text(payload::encode(op, d).into()))
+            .await
+            .map_err(|_| End::disconnected());
     }
 }
 
@@ -262,7 +417,18 @@ async fn replaced(session: &mut Option<Session>) {
     {
         return;
     }
-    std::future::pending().await
+
+    return std::future::pending().await;
+}
+
+fn random<const N: usize>() -> [u8; N] {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).expect("system RNG");
+    bytes
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// v8 acks `{t}`; older versions echo the nonce. Every version gets op 6,
@@ -281,8 +447,17 @@ mod tests {
 
     #[test]
     fn heartbeat_ack_per_version() {
-        assert_eq!(heartbeat_ack(8, json!({"t": 1730000000000u64, "seq_ack": 7})), json!({"t": 1730000000000u64}));
-        assert_eq!(heartbeat_ack(7, json!(1730000000000u64)), json!(1730000000000u64));
-        assert_eq!(heartbeat_ack(5, json!("1730000000000")), json!("1730000000000"));
+        assert_eq!(
+            heartbeat_ack(8, json!({"t": 1730000000000u64, "seq_ack": 7})),
+            json!({"t": 1730000000000u64})
+        );
+        assert_eq!(
+            heartbeat_ack(7, json!(1730000000000u64)),
+            json!(1730000000000u64)
+        );
+        assert_eq!(
+            heartbeat_ack(5, json!("1730000000000")),
+            json!("1730000000000")
+        );
     }
 }
