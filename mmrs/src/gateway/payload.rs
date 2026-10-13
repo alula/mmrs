@@ -10,8 +10,12 @@ pub struct Frame {
     pub d: Value,
 }
 
-pub fn encode(op: u32, d: impl Serialize) -> String {
-    serde_json::json!({ "op": op, "d": d }).to_string()
+pub fn encode(op: u32, d: impl Serialize, seq: Option<u32>) -> String {
+    match seq {
+        Some(seq) => serde_json::json!({ "seq": seq, "op": op, "d": d }),
+        None => serde_json::json!({ "op": op, "d": d }),
+    }
+    .to_string()
 }
 
 #[derive(Deserialize)]
@@ -102,6 +106,67 @@ pub struct SessionDescription {
 pub struct BackendVersion {
     pub voice: &'static str,
     pub rtc_worker: &'static str,
+}
+
+/// A bool before v4, flags from v4 on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SpeakingState {
+    Flags(u32),
+    Bool(bool),
+}
+
+impl SpeakingState {
+    pub fn for_version(version: u8, flags: u32) -> Self {
+        if version >= 4 {
+            Self::Flags(flags)
+        } else {
+            Self::Bool(flags != 0)
+        }
+    }
+
+    pub fn flags(self) -> u32 {
+        match self {
+            Self::Flags(flags) => flags,
+            Self::Bool(speaking) => u32::from(speaking),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ClientSpeaking {
+    pub speaking: SpeakingState,
+    #[serde(default)]
+    pub ssrc: u32,
+}
+
+#[derive(Serialize)]
+pub struct Speaking<'a> {
+    pub user_id: &'a str,
+    pub ssrc: u32,
+    pub speaking: SpeakingState,
+}
+
+#[derive(Serialize)]
+pub struct ClientsConnect<'a> {
+    pub user_ids: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+pub struct ClientDisconnect<'a> {
+    pub user_id: &'a str,
+}
+
+#[derive(Serialize)]
+pub struct ClientFlags<'a> {
+    pub user_id: &'a str,
+    pub flags: Option<u32>,
+}
+
+#[derive(Serialize)]
+pub struct Platform<'a> {
+    pub user_id: &'a str,
+    pub platform: Option<u32>,
 }
 
 /// Android sends snowflakes as JSON numbers.

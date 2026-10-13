@@ -23,8 +23,6 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(2 * 13_750 + 5_000);
 const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_STREAMS: usize = 4;
 
-const DTLS_FINGERPRINT_PLACEHOLDER: &str = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
-
 pub struct Connection {
     socket: WebSocket,
     state: Arc<AppState>,
@@ -32,6 +30,7 @@ pub struct Connection {
     version: u8,
     client_addr: SocketAddr,
     session: Option<Session>,
+    seq: u32,
 }
 
 struct Session {
@@ -88,6 +87,7 @@ impl Connection {
             version,
             client_addr,
             session: None,
+            seq: 0,
         }
     }
 
@@ -180,6 +180,9 @@ impl Connection {
                 let select = serde_json::from_value(frame.d)
                     .map_err(|_| End::protocol(CloseCode::DecodeError))?;
                 self.select_protocol(select).await
+            }
+            opcode::SPEAKING => {
+                Ok(())
             }
             opcode::VOICE_BACKEND_VERSION => {
                 let version = concat!("mmrs ", env!("CARGO_PKG_VERSION"));
@@ -404,9 +407,15 @@ impl Connection {
     }
 
     async fn send(&mut self, op: u32, d: impl Serialize) -> Result<(), End> {
+        let seq = (self.version >= 8 && opcode::is_sequenced(op)).then(|| {
+            let seq = self.seq;
+            self.seq += 1;
+            seq
+        });
+
         return self
             .socket
-            .send(Message::Text(payload::encode(op, d).into()))
+            .send(Message::Text(payload::encode(op, d, seq).into()))
             .await
             .map_err(|_| End::disconnected());
     }
