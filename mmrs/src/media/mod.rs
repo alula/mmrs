@@ -1,3 +1,4 @@
+mod cipher;
 mod discovery;
 mod rtp;
 mod stun;
@@ -8,10 +9,15 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arrayvec::ArrayVec;
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
 use crate::media::discovery::{Discovery, ProtocolVersion};
+
+const MAX_PACKET: usize = 2048;
+
+type PacketBuf = ArrayVec<u8, MAX_PACKET>;
 
 const DTLS_FINGERPRINT_PLACEHOLDER: &str = "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:00";
 
