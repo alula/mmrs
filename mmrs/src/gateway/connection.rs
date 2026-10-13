@@ -17,7 +17,7 @@ use super::payload::{
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
-use crate::media::{IceLease, SsrcLease};
+use crate::media::{IceLease, Leg};
 use crate::room::{Membership, Push, RoomKey, Speaking};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
@@ -44,7 +44,7 @@ struct Session {
     replaced: oneshot::Receiver<()>,
     membership: Membership,
     pushes: mpsc::UnboundedReceiver<Push>,
-    _ssrcs: SsrcLease,
+    leg: Leg,
     transport: Option<Transport>,
 }
 
@@ -265,19 +265,19 @@ impl Connection {
             session_id: ticket.session_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
-        let ssrcs = self
+        let room = RoomKey {
+            tenant: self.tenant.name.clone(),
+            room: ticket.room.clone(),
+        };
+        let leg = self
             .state
             .media
-            .lease_ssrcs(1 + 2 * identify.streams.len() as u32);
-        let ready = self.ready(ssrcs.first(), identify.streams);
-        let (membership, pushes) = self.state.rooms.join(
-            RoomKey {
-                tenant: self.tenant.name.clone(),
-                room: ticket.room.clone(),
-            },
-            registration.conn_id,
-            ticket.user_id.clone(),
-        );
+            .open_leg(room.clone(), 1 + 2 * identify.streams.len() as u32);
+        let ready = self.ready(leg.first_ssrc(), identify.streams);
+        let (membership, pushes) =
+            self.state
+                .rooms
+                .join(room, registration.conn_id, ticket.user_id.clone());
 
         let info = SessionRef {
             user_id: ticket.user_id,
@@ -294,7 +294,7 @@ impl Connection {
             replaced: registration.replaced,
             membership,
             pushes,
-            _ssrcs: ssrcs,
+            leg,
             transport: None,
         });
 
@@ -390,8 +390,11 @@ impl Connection {
             .filter(|mode| self.state.config.encryption_modes.contains(mode))
             .ok_or_else(|| End::protocol(CloseCode::UnknownEncryptionMode))?;
 
+        let Some(session) = &self.session else {
+            return Err(End::protocol(CloseCode::NotAuthenticated));
+        };
         description.mode = Some(mode);
-        description.secret_key = Some(random());
+        description.secret_key = Some(session.leg.select_udp(mode));
 
         return Ok(Transport::Udp);
     }
