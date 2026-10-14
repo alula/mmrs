@@ -1,10 +1,12 @@
-use std::net::SocketAddr;
+use std::fmt::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use mmrs_protocol::{EndReason, Event, SessionRef, TicketResponse, VoiceToken};
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Instant, sleep_until};
@@ -44,7 +46,7 @@ pub struct Session {
     pub info: SessionRef,
     /// The IDENTIFY token, which a RESUME must repeat.
     pub token: String,
-    replaced: oneshot::Receiver<()>,
+    pub replaced: oneshot::Receiver<()>,
     membership: Membership,
     pushes: mpsc::UnboundedReceiver<Push>,
     leg: Leg,
@@ -123,7 +125,7 @@ impl Connection {
         };
         // Clients only resume once they have a SESSION_DESCRIPTION.
         if end.resumable() && session.transport.is_some() {
-            Parking::park(&self.state, self.tenant.clone(), session, end.reason);
+            Parking::park(&self.state, self.tenant.clone(), session, end.reason).await;
         } else {
             end_session(&self.state, &self.tenant, session, end.reason).await;
         }
@@ -146,10 +148,10 @@ impl Connection {
             let identified = self.session.is_some();
             let message = tokio::select! {
                 message = self.socket.recv() => message,
-                _ = sleep_until(heartbeat_deadline) => {
+                () = sleep_until(heartbeat_deadline) => {
                     return End::new(CloseCode::SessionTimeout, EndReason::HeartbeatTimeout);
                 }
-                _ = sleep_until(identify_deadline), if !identified => {
+                () = sleep_until(identify_deadline), if !identified => {
                     return End::protocol(CloseCode::NotAuthenticated);
                 }
                 signal = session_signal(&mut self.session) => match signal {
@@ -170,7 +172,7 @@ impl Connection {
             };
 
             if let Some(Ok(message)) = message.as_ref() {
-                self.log_message("<~", message);
+                log_message("<~", message);
             }
 
             let text = match message {
@@ -212,24 +214,20 @@ impl Connection {
                 Err(End::protocol(CloseCode::AlreadyAuthenticated))
             }
             opcode::IDENTIFY => {
-                let identify = serde_json::from_value(frame.d)
-                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let identify = decode(frame.d)?;
                 self.identify(identify).await
             }
             opcode::RESUME => {
-                let resume = serde_json::from_value(frame.d)
-                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let resume = decode(frame.d)?;
                 self.resume(resume).await
             }
             _ if self.session.is_none() => Err(End::protocol(CloseCode::NotAuthenticated)),
             opcode::SELECT_PROTOCOL => {
-                let select = serde_json::from_value(frame.d)
-                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let select = decode(frame.d)?;
                 self.select_protocol(select).await
             }
             opcode::SPEAKING => {
-                let speaking: ClientSpeaking = serde_json::from_value(frame.d)
-                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let speaking: ClientSpeaking = decode(frame.d)?;
                 if let Some(session) = &self.session {
                     // Browsers name their own SSRC; MMRS forwards every
                     // client's audio from the leg's.
@@ -241,10 +239,9 @@ impl Connection {
                 Ok(())
             }
             opcode::MEDIA_SINK_WANTS => {
-                let wants: payload::MediaSinkWants = serde_json::from_value(frame.d)
-                    .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+                let wants: payload::MediaSinkWants = decode(frame.d)?;
                 if let Some(session) = &self.session {
-                    session.leg.set_wants(sink_wants(wants));
+                    session.leg.set_wants(sink_wants(&wants));
                 }
                 Ok(())
             }
@@ -265,7 +262,7 @@ impl Connection {
 
     /// Client binary frames: `op u8`, payload. Only DAVE uses them.
     fn handle_binary(&mut self, data: &[u8]) -> Result<(), End> {
-        let Some((&op, payload)) = data.split_first() else {
+        let Some((&_op, _payload)) = data.split_first() else {
             return Err(End::protocol(CloseCode::DecodeError));
         };
         if self.session.is_none() {
@@ -385,10 +382,7 @@ impl Connection {
 
         self.send(opcode::RESUMED, Value::Null).await?;
         for message in missed {
-            self.socket
-                .send(message)
-                .await
-                .map_err(|_| End::disconnected())?;
+            self.send_message(message).await?;
         }
         return Ok(());
     }
@@ -470,8 +464,7 @@ impl Connection {
         select: SelectProtocol,
         description: &mut payload::SessionDescription,
     ) -> Result<Transport, End> {
-        let data: UdpProtocolData = serde_json::from_value(select.data)
-            .map_err(|_| End::protocol(CloseCode::DecodeError))?;
+        let data: UdpProtocolData = decode(select.data)?;
         let mode = data
             .mode
             .parse::<EncryptionMode>()
@@ -482,8 +475,15 @@ impl Connection {
         let Some(session) = &self.session else {
             return Err(End::protocol(CloseCode::NotAuthenticated));
         };
+        let addr = data
+            .address
+            .as_deref()
+            .and_then(|ip| ip.parse::<IpAddr>().ok())
+            .zip(data.port)
+            .filter(|&(ip, port)| !ip.is_unspecified() && port != 0)
+            .map(|(ip, port)| SocketAddr::new(ip, port));
         description.mode = Some(mode);
-        description.secret_key = Some(session.leg.select_udp(mode));
+        description.secret_key = Some(session.leg.select_udp(mode, addr));
 
         return Ok(Transport::Udp);
     }
@@ -575,13 +575,7 @@ impl Connection {
             Some(session) => session.replay.encode(op, d),
             None => Message::Text(payload::encode(op, d, None).into()),
         };
-        self.log_message("~>", &message);
-
-        return self
-            .socket
-            .send(message)
-            .await
-            .map_err(|_| End::disconnected());
+        return self.send_message(message).await;
     }
 
     async fn send_binary(&mut self, op: u8, data: &[u8]) -> Result<(), End> {
@@ -589,26 +583,33 @@ impl Connection {
             Some(session) => session.replay.encode_binary(op, data),
             None => Message::Binary(payload::encode_binary(op, data, None).into()),
         };
-        self.log_message("~>", &message);
+        return self.send_message(message).await;
+    }
 
+    async fn send_message(&mut self, message: Message) -> Result<(), End> {
+        log_message("~>", &message);
         return self
             .socket
             .send(message)
             .await
             .map_err(|_| End::disconnected());
     }
+}
 
-    fn log_message(&self, prefix: &str, message: &Message) {
-        match message {
-            Message::Text(text) => {
-                tracing::trace!("{} {}", prefix, text.as_str());
-            }
-            Message::Binary(data) => {
-                tracing::trace!("{} binary {} bytes", prefix, data.len());
-            }
-            Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {}
+fn log_message(prefix: &str, message: &Message) {
+    match message {
+        Message::Text(text) => {
+            tracing::trace!("{} {}", prefix, text.as_str());
         }
+        Message::Binary(data) => {
+            tracing::trace!("{} binary {} bytes", prefix, data.len());
+        }
+        Message::Ping(_) | Message::Pong(_) | Message::Close(_) => {}
     }
+}
+
+fn decode<T: DeserializeOwned>(value: Value) -> Result<T, End> {
+    serde_json::from_value(value).map_err(|_| End::protocol(CloseCode::DecodeError))
 }
 
 pub async fn end_session(state: &AppState, tenant: &Tenant, session: Session, reason: EndReason) {
@@ -634,7 +635,7 @@ async fn session_signal(session: &mut Option<Session>) -> Signal {
     }
 }
 
-fn sink_wants(wants: payload::MediaSinkWants) -> SinkWants {
+fn sink_wants(wants: &payload::MediaSinkWants) -> SinkWants {
     let ssrcs = wants
         .ssrcs
         .iter()
@@ -657,7 +658,11 @@ fn random<const N: usize>() -> [u8; N] {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
 }
 
 /// v8 acks `{t}`; older versions echo the nonce. Every version gets op 6,
@@ -682,7 +687,7 @@ mod tests {
             "pixelCounts": {"20218": 0},
         }))
         .unwrap();
-        let wants = sink_wants(wants);
+        let wants = sink_wants(&wants);
 
         assert_eq!(wants.any, 0);
         assert_eq!(wants.ssrcs.len(), 1);

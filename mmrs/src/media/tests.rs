@@ -72,7 +72,7 @@ async fn clients(count: usize) -> (Arc<Media>, Vec<Client>) {
     let mut clients = Vec::new();
     for _ in 0..count {
         let leg = media.open_leg(room.clone(), 3);
-        let cipher = Cipher::new(mode, &leg.select_udp(mode));
+        let cipher = Cipher::new(mode, &leg.select_udp(mode, None));
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         socket.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
 
@@ -104,9 +104,13 @@ async fn forwards_rtp_between_udp_legs() {
     let (_media, clients) = clients(2).await;
     let [a, b] = &clients[..] else { unreachable!() };
 
-    let ping = [0x13, 0x37, 0xca, 0xfe, 1, 0, 0, 0];
-    a.socket.send(&ping).await.unwrap();
-    assert_eq!(recv(&a.socket).await, ping);
+    for ping in [
+        [0x13, 0x37, 0xca, 0xfe, 1, 0, 0, 0],
+        [0x80, 0xc9, 0x00, 0x01, 0, 0, 0, 1],
+    ] {
+        a.socket.send(&ping).await.unwrap();
+        assert_eq!(recv(&a.socket).await, ping);
+    }
 
     let rtp = audio(a.leg.first_ssrc(), 1);
     a.socket

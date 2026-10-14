@@ -97,32 +97,29 @@ async fn main() -> anyhow::Result<()> {
         .with_state(state)
         .into_make_service_with_connect_info::<SocketAddr>();
 
-    match tls {
-        Some(tls) => {
-            let handle = axum_server::Handle::new();
+    if let Some(tls) = tls {
+        let handle = axum_server::Handle::new();
 
-            tokio::spawn({
-                let handle = handle.clone();
-                async move {
-                    stopped.await;
-                    handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
-                }
-            });
+        tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                stopped.await;
+                handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
+            }
+        });
 
-            tracing::info!(%bind, "voice gateway listening with TLS");
-            axum_server::bind_rustls(bind, tls)
-                .handle(handle)
-                .serve(app)
-                .await?;
-        }
-        None => {
-            let listener = tokio::net::TcpListener::bind(bind).await?;
+        tracing::info!(%bind, "voice gateway listening with TLS");
+        axum_server::bind_rustls(bind, tls)
+            .handle(handle)
+            .serve(app)
+            .await?;
+    } else {
+        let listener = tokio::net::TcpListener::bind(bind).await?;
 
-            tracing::info!(%bind, "voice gateway listening");
-            axum::serve(listener, app)
-                .with_graceful_shutdown(stopped)
-                .await?;
-        }
+        tracing::info!(%bind, "voice gateway listening");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(stopped)
+            .await?;
     }
 
     // Upgraded WebSockets are not tracked by the graceful shutdown above.

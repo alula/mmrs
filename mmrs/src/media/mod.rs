@@ -5,17 +5,18 @@ mod rtp;
 mod stun;
 mod webrtc;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
 use str0m::config::Fingerprint;
 use str0m::rtp::RtpPacket;
 use str0m::{IceCreds, RtcError};
+use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
@@ -60,7 +61,7 @@ pub struct Media {
 #[derive(Default)]
 struct Legs {
     next_id: u64,
-    legs: HashMap<u64, LegState>,
+    by_id: HashMap<u64, LegState>,
     /// Every SSRC handed out in READY. IP discovery is answered only for these.
     by_ssrc: HashMap<u32, u64>,
     rooms: HashMap<RoomKey, HashSet<u64>>,
@@ -81,7 +82,7 @@ struct LegState {
     transport: Option<Transport>,
     wants: SinkWants,
     /// What MMRS received on the leg's media SSRCs, for receiver reports.
-    received: HashMap<u32, ReceiveStats>,
+    received: BTreeMap<u32, ReceiveStats>,
 }
 
 impl LegState {
@@ -111,30 +112,30 @@ impl LegState {
     /// Discord reports audio with the client's audio SSRC as sender and
     /// video with the first video SSRC.
     fn receiver_reports(&mut self, now: Instant) -> Option<Vec<u8>> {
-        let audio = self.ssrcs.start;
-        let mut ssrcs: Vec<u32> = self.received.keys().copied().collect();
-        ssrcs.sort_unstable();
-        let (audio_blocks, video_blocks): (Vec<_>, Vec<_>) = ssrcs
-            .into_iter()
-            .map(|ssrc| {
-                (
-                    ssrc,
-                    self.received
-                        .get_mut(&ssrc)
-                        .unwrap()
-                        .report_block(ssrc, now),
-                )
-            })
-            .partition(|&(ssrc, _)| ssrc == audio);
-
-        let mut compound = Vec::new();
-        for (sender, blocks) in [(audio, audio_blocks), (audio + 1, video_blocks)] {
-            if !blocks.is_empty() {
-                let blocks: Vec<_> = blocks.into_iter().map(|(_, block)| block).collect();
-                rtcp::write_rr(&mut compound, sender, &blocks);
-            }
+        if self.received.is_empty() {
+            return None;
         }
-        (!compound.is_empty()).then_some(compound)
+
+        let audio = self.ssrcs.start;
+        let mut compound = Vec::new();
+
+        if let Some(stats) = self.received.get_mut(&audio) {
+            let block = stats.report_block(audio, now);
+            rtcp::write_rr(&mut compound, audio, &[block]);
+        }
+
+        let video_blocks: Vec<_> = self
+            .received
+            .iter_mut()
+            .filter(|&(&ssrc, _)| ssrc != audio)
+            .map(|(&ssrc, stats)| stats.report_block(ssrc, now))
+            .collect();
+
+        if !video_blocks.is_empty() {
+            rtcp::write_rr(&mut compound, audio + 1, &video_blocks);
+        }
+
+        Some(compound)
     }
 
     /// Encrypts `plain` for this leg's client, if it has a key and an
@@ -143,6 +144,7 @@ impl LegState {
         let (Some(addr), Some(Transport::Udp(udp))) = (self.addr, &mut self.transport) else {
             return None;
         };
+
         let sealed = udp.cipher.seal(plain, header_len, udp.n4)?;
         udp.n4 = udp.n4.wrapping_add(1);
         Some((sealed, addr))
@@ -253,18 +255,21 @@ impl Media {
         if self.receive_webrtc(packet, from) {
             return;
         }
-        if let Some(request) = Discovery::parse_request(packet) {
-            self.discovery(request.ssrc, request.protocol_version, from);
-        } else if stun::is_stun(packet) {
-            self.receive_stun(packet, from);
-        } else if packet.len() == 8 {
+        if packet.len() == 8 {
             // Native and discord.js keepalives. Clients take any 8 byte
             // datagram as the reply, so media must never be 8 bytes long.
             self.send(packet, from);
-        } else if let Some(Packet::Rtp { ssrc, header_len }) = Packet::classify(packet) {
-            self.forward_rtp(ssrc, header_len, packet, from);
-        } else if let Some(Packet::Rtcp { ssrc }) = Packet::classify(packet) {
-            self.receive_rtcp(ssrc, packet, from);
+        } else if let Some(classified) = Packet::classify(packet) {
+            match classified {
+                Packet::Rtp { ssrc, header_len } => {
+                    self.forward_rtp(ssrc, header_len, packet, from);
+                }
+                Packet::Rtcp { ssrc } => self.receive_rtcp(ssrc, packet, from),
+            }
+        } else if stun::is_stun(packet) {
+            self.receive_stun(packet, from);
+        } else if let Some(request) = Discovery::parse_request(packet) {
+            self.discovery(request.ssrc, request.protocol_version, from);
         } else {
             tracing::trace!(len = packet.len(), %from, "dropping media packet");
         }
@@ -284,11 +289,12 @@ impl Media {
 
     fn discovery(&self, ssrc: u32, version: ProtocolVersion, from: SocketAddr) {
         {
-            let mut legs = self.legs.lock().unwrap();
+            let mut legs = self.legs.lock();
             let Some(&id) = legs.by_ssrc.get(&ssrc) else {
                 return;
             };
-            let leg = legs.legs.get_mut(&id).expect("indexed leg exists");
+
+            let leg = legs.by_id.get_mut(&id).expect("indexed leg exists");
             leg.addr.get_or_insert(from);
         }
 
@@ -300,9 +306,9 @@ impl Media {
     }
 
     fn forward_rtp(&self, ssrc: u32, header_len: usize, packet: &[u8], from: SocketAddr) {
-        let mut guard = self.legs.lock().unwrap();
+        let mut guard = self.legs.lock();
         let Legs {
-            legs,
+            by_id,
             by_ssrc,
             rooms,
             ..
@@ -311,11 +317,11 @@ impl Media {
         let Some(&sender_id) = by_ssrc.get(&ssrc) else {
             return;
         };
-        let Some(plain) = authenticate(legs, sender_id, packet, header_len, from) else {
+        let Some(plain) = authenticate(by_id, sender_id, packet, header_len, from) else {
             return;
         };
         let now = Instant::now();
-        let sender = legs.get_mut(&sender_id).expect("indexed leg exists");
+        let sender = by_id.get_mut(&sender_id).expect("indexed leg exists");
         sender.record_rtp(ssrc, &plain, now);
         let kind = if ssrc == sender.ssrcs.start {
             ForwardKind::Audio
@@ -333,7 +339,7 @@ impl Media {
             kind,
         };
         let mut received = Vec::new();
-        self.fan_out(legs, members, sender_id, &forward, &mut received);
+        self.fan_out(by_id, members, sender_id, &forward, &mut received);
         self.forward_browser_rtp(&mut guard, received);
     }
 
@@ -380,9 +386,9 @@ impl Media {
     /// Forwards browser audio as native Opus from the leg's own SSRC, so
     /// every SSRC in a room is one MMRS handed out.
     fn forward_browser_rtp(&self, legs: &mut Legs, mut received: Vec<(u64, RtpPacket)>) {
-        let Legs { legs, rooms, .. } = legs;
+        let Legs { by_id, rooms, .. } = legs;
         while let Some((sender_id, packet)) = received.pop() {
-            let Some(sender) = legs.get(&sender_id) else {
+            let Some(sender) = by_id.get(&sender_id) else {
                 continue;
             };
             let ssrc = sender.ssrcs.start;
@@ -406,7 +412,7 @@ impl Media {
                 header_len,
                 kind: ForwardKind::Audio,
             };
-            self.fan_out(legs, members, sender_id, &forward, &mut received);
+            self.fan_out(by_id, members, sender_id, &forward, &mut received);
         }
     }
 
@@ -416,14 +422,14 @@ impl Media {
         let Some(request) = stun::BindingRequest::parse(packet) else {
             return;
         };
-        let mut guard = self.legs.lock().unwrap();
+        let mut guard = self.legs.lock();
         let Some(&id) = guard.ice.get(request.local_ufrag()) else {
             return;
         };
         let Some(LegState {
             transport: Some(Transport::WebRtc(webrtc)),
             ..
-        }) = guard.legs.get_mut(&id)
+        }) = guard.by_id.get_mut(&id)
         else {
             return;
         };
@@ -440,14 +446,14 @@ impl Media {
     }
 
     fn receive_webrtc(&self, packet: &[u8], from: SocketAddr) -> bool {
-        let mut guard = self.legs.lock().unwrap();
+        let mut guard = self.legs.lock();
         let Some(&id) = guard.peers.get(&from) else {
             return false;
         };
         let Some(LegState {
             transport: Some(Transport::WebRtc(webrtc)),
             ..
-        }) = guard.legs.get_mut(&id)
+        }) = guard.by_id.get_mut(&id)
         else {
             return false;
         };
@@ -470,9 +476,9 @@ impl Media {
     }
 
     fn expire_timers(&self, now: Instant) {
-        let mut guard = self.legs.lock().unwrap();
+        let mut guard = self.legs.lock();
         let mut received = Vec::new();
-        for (&id, leg) in &mut guard.legs {
+        for (&id, leg) in &mut guard.by_id {
             let Some(Transport::WebRtc(webrtc)) = &mut leg.transport else {
                 continue;
             };
@@ -488,9 +494,9 @@ impl Media {
     /// without their report blocks, NACK and PLI go to the leg that owns
     /// the media SSRC, everything else stops here.
     fn receive_rtcp(&self, ssrc: u32, packet: &[u8], from: SocketAddr) {
-        let mut guard = self.legs.lock().unwrap();
+        let mut guard = self.legs.lock();
         let Legs {
-            legs,
+            by_id,
             by_ssrc,
             rooms,
             ..
@@ -499,10 +505,12 @@ impl Media {
         let Some(&sender_id) = by_ssrc.get(&ssrc) else {
             return;
         };
-        let Some(plain) = authenticate(legs, sender_id, packet, RTCP_HEADER_LEN, from) else {
+
+        let Some(plain) = authenticate(by_id, sender_id, packet, RTCP_HEADER_LEN, from) else {
             return;
         };
-        let room = legs[&sender_id].room.clone();
+
+        let room = by_id[&sender_id].room.clone();
         let now = Instant::now();
 
         for packet in rtcp::packets(&plain) {
@@ -519,7 +527,7 @@ impl Media {
                     ) else {
                         continue;
                     };
-                    let sender = legs.get_mut(&sender_id).expect("indexed leg exists");
+                    let sender = by_id.get_mut(&sender_id).expect("indexed leg exists");
                     if let Some(stats) = sender.received.get_mut(&ssrc) {
                         stats.record_sr(ntp_middle, now);
                     }
@@ -530,7 +538,7 @@ impl Media {
                             header_len: RTCP_HEADER_LEN,
                             kind: ForwardKind::Rtcp,
                         };
-                        self.fan_out(legs, members, sender_id, &forward, &mut Vec::new());
+                        self.fan_out(by_id, members, sender_id, &forward, &mut Vec::new());
                     }
                 }
                 (rtcp::RTPFB, rtcp::FMT_NACK) | (rtcp::PSFB, rtcp::FMT_PLI) => {
@@ -539,7 +547,7 @@ impl Media {
                     else {
                         continue;
                     };
-                    let owner = legs.get_mut(&owner_id).expect("indexed leg exists");
+                    let owner = by_id.get_mut(&owner_id).expect("indexed leg exists");
                     if owner_id == sender_id || owner.room != room {
                         continue;
                     }
@@ -562,8 +570,8 @@ impl Media {
     }
 
     fn send_reports(&self, now: Instant) {
-        let mut legs = self.legs.lock().unwrap();
-        for leg in legs.legs.values_mut() {
+        let mut legs = self.legs.lock();
+        for leg in legs.by_id.values_mut() {
             let Some(compound) = leg.receiver_reports(now) else {
                 continue;
             };
@@ -573,27 +581,28 @@ impl Media {
         }
     }
 
+
     /// Allocates `count` consecutive SSRCs, none of them 0, for a client in
     /// `room`.
     pub fn open_leg(self: &Arc<Self>, room: RoomKey, count: u32) -> Leg {
         let first = allocate(&self.next_ssrc, count);
         let ssrcs = first..first + count;
 
-        let mut legs = self.legs.lock().unwrap();
+        let mut legs = self.legs.lock();
         let id = legs.next_id;
         legs.next_id += 1;
 
         legs.by_ssrc.extend(ssrcs.clone().map(|ssrc| (ssrc, id)));
         legs.rooms.entry(room.clone()).or_default().insert(id);
-        legs.legs.insert(
+        legs.by_id.insert(
             id,
             LegState {
                 room,
-                ssrcs: ssrcs.clone(),
+                ssrcs,
                 addr: None,
                 transport: None,
                 wants: SinkWants::default(),
-                received: HashMap::new(),
+                received: BTreeMap::new(),
             },
         );
 
@@ -603,6 +612,7 @@ impl Media {
             first_ssrc: first,
         }
     }
+
 }
 
 /// Decrypts a packet from the leg's client and moves the leg's address to
@@ -624,6 +634,7 @@ fn authenticate(
         tracing::debug!(old = ?leg.addr, new = %from, "media address moved");
         leg.addr = Some(from);
     }
+
     Some(plain)
 }
 
@@ -640,26 +651,28 @@ impl Leg {
     }
 
     /// Switches the leg to the `udp` protocol and returns the new key.
-    pub fn select_udp(&self, mode: EncryptionMode) -> [u8; 32] {
+    pub fn select_udp(&self, mode: EncryptionMode, addr: Option<SocketAddr>) -> [u8; 32] {
         let mut key = [0; 32];
         getrandom::fill(&mut key).expect("system RNG");
 
-        let mut legs = self.media.legs.lock().unwrap();
-        let leg = legs.legs.get_mut(&self.id).expect("open leg exists");
+        let mut legs = self.media.legs.lock();
+        let leg = legs.by_id.get_mut(&self.id).expect("open leg exists");
+        if let Some(addr) = addr {
+            leg.addr = Some(addr);
+        }
         leg.transport = Some(Transport::Udp(UdpLeg {
             cipher: Cipher::new(mode, &key),
             n4: 0,
         }));
-        key
-    }
-}
 
-impl Leg {
+        return key;
+    }
+
     /// Switches the leg to the `webrtc` protocol, reachable at `ip`, and
     /// returns the SDP for op 4.
     pub fn select_webrtc(&self, offer: Offer, ip: IpAddr) -> Result<String, RtcError> {
         let local = SocketAddr::new(ip, self.media.port);
-        let mut legs = self.media.legs.lock().unwrap();
+        let mut legs = self.media.legs.lock();
         let ufrag = loop {
             let ufrag = ice_chars(4);
             if !legs.ice.contains_key(&ufrag) {
@@ -673,23 +686,23 @@ impl Leg {
 
         let webrtc = WebRtcLeg::new(&self.media.dtls, local, ice.clone(), offer, Instant::now())?;
         legs.ice.insert(ice.ufrag.clone(), self.id);
-        let leg = legs.legs.get_mut(&self.id).expect("open leg exists");
+        let leg = legs.by_id.get_mut(&self.id).expect("open leg exists");
         leg.transport = Some(Transport::WebRtc(Box::new(webrtc)));
 
-        Ok(sdp_answer(local, &ice, &self.media.dtls.fingerprint))
+        return Ok(sdp_answer(local, &ice, &self.media.dtls.fingerprint));
     }
 
     pub fn set_wants(&self, wants: SinkWants) {
-        let mut legs = self.media.legs.lock().unwrap();
-        legs.legs.get_mut(&self.id).expect("open leg exists").wants = wants;
+        let mut legs = self.media.legs.lock();
+        legs.by_id.get_mut(&self.id).expect("open leg exists").wants = wants;
     }
 }
 
 impl Drop for Leg {
     fn drop(&mut self) {
-        let mut guard = self.media.legs.lock().unwrap();
+        let mut guard = self.media.legs.lock();
         let legs = &mut *guard;
-        let Some(leg) = legs.legs.remove(&self.id) else {
+        let Some(leg) = legs.by_id.remove(&self.id) else {
             return;
         };
 
@@ -702,10 +715,11 @@ impl Drop for Leg {
         for ssrc in leg.ssrcs.clone() {
             legs.by_ssrc.remove(&ssrc);
         }
+
         if let Some(members) = legs.rooms.get_mut(&leg.room) {
             members.remove(&self.id);
             for id in members.iter() {
-                let member = legs.legs.get_mut(id).expect("room member exists");
+                let member = legs.by_id.get_mut(id).expect("room member exists");
                 if let Some(Transport::WebRtc(webrtc)) = &mut member.transport {
                     webrtc.forget(leg.ssrcs.clone());
                 }

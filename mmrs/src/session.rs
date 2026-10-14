@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::Mutex;
 use tokio::sync::oneshot;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -32,7 +32,7 @@ impl Sessions {
     pub fn register(&self, key: SessionKey) -> Registration {
         let conn_id = self.next_conn_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        let old = self.live.lock().unwrap().insert(
+        let old = self.live.lock().insert(
             key,
             Entry {
                 conn_id,
@@ -51,11 +51,11 @@ impl Sessions {
     }
 
     pub fn count(&self) -> usize {
-        self.live.lock().unwrap().len()
+        self.live.lock().len()
     }
 
     pub fn unregister(&self, key: &SessionKey, conn_id: u64) {
-        let mut live = self.live.lock().unwrap();
+        let mut live = self.live.lock();
         if live.get(key).is_some_and(|entry| entry.conn_id == conn_id) {
             live.remove(key);
         }

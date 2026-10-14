@@ -109,6 +109,8 @@ pub struct Codec {
 
 #[derive(Deserialize)]
 pub struct UdpProtocolData {
+    pub address: Option<String>,
+    pub port: Option<u16>,
     pub mode: String,
 }
 

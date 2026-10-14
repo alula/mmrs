@@ -1,9 +1,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::Message;
+use parking_lot::Mutex;
 use mmrs_protocol::EndReason;
 use serde::Serialize;
 
@@ -36,7 +37,12 @@ pub struct Parking {
 }
 
 impl Parking {
-    pub fn park(state: &Arc<AppState>, tenant: Arc<Tenant>, session: Session, reason: EndReason) {
+    pub async fn park(
+        state: &Arc<AppState>,
+        tenant: Arc<Tenant>,
+        mut session: Session,
+        reason: EndReason,
+    ) {
         let key = ParkKey {
             tenant: tenant.name.clone(),
             session_id: session.info.session_id.clone(),
@@ -45,24 +51,31 @@ impl Parking {
             .parking
             .next_generation
             .fetch_add(1, Ordering::Relaxed);
-        state.parking.parked.lock().unwrap().insert(
-            key.clone(),
-            Parked {
-                session,
-                generation,
-            },
-        );
-
+        {
+            let mut parked = state.parking.parked.lock();
+            if session.replaced.try_recv().is_ok() {
+                drop(parked);
+                end_session(state, &tenant, session, EndReason::Replaced).await;
+                return;
+            }
+            parked.insert(
+                key.clone(),
+                Parked {
+                    session,
+                    generation,
+                },
+            );
+        }
         let state = state.clone();
         tokio::spawn(async move {
             let mut shutdown = state.shutdown.clone();
             let reason = tokio::select! {
-                _ = tokio::time::sleep(RESUME_WINDOW) => reason,
+                () = tokio::time::sleep(RESUME_WINDOW) => reason,
                 _ = shutdown.wait_for(|stop| *stop) => EndReason::NodeShutdown,
             };
 
             let expired = {
-                let mut parked = state.parking.parked.lock().unwrap();
+                let mut parked = state.parking.parked.lock();
                 match parked.get(&key) {
                     Some(entry) if entry.generation == generation => parked.remove(&key),
                     _ => None,
@@ -77,7 +90,7 @@ impl Parking {
     /// Takes the session if the RESUME carries the token and server it
     /// identified with.
     pub fn claim(&self, key: &ParkKey, token: &str, server_id: &str) -> Option<Session> {
-        let mut parked = self.parked.lock().unwrap();
+        let mut parked = self.parked.lock();
         let entry = parked.get(key)?;
         if entry.session.token != token || entry.session.info.server_id != server_id {
             return None;
@@ -86,11 +99,7 @@ impl Parking {
     }
 
     pub fn take(&self, key: &ParkKey) -> Option<Session> {
-        self.parked
-            .lock()
-            .unwrap()
-            .remove(key)
-            .map(|entry| entry.session)
+        self.parked.lock().remove(key).map(|entry| entry.session)
     }
 }
 
@@ -205,7 +214,7 @@ mod tests {
     #[test]
     fn overflow_fails_old_acks() {
         let mut replay = Replay::default();
-        for _ in 0..MAX_UNACKED + 1 {
+        for _ in 0..=MAX_UNACKED {
             replay.encode(5, ());
         }
 

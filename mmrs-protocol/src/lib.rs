@@ -13,18 +13,22 @@ use serde::{Deserialize, Serialize};
 pub mod subjects {
     pub const DEFAULT_PREFIX: &str = "mmrs";
 
+    #[must_use]
     pub fn ticket_resolve(prefix: &str) -> String {
         format!("{prefix}.ticket.resolve")
     }
 
+    #[must_use]
     pub fn events(prefix: &str, node_id: &str) -> String {
         format!("{prefix}.events.{node_id}")
     }
 
+    #[must_use]
     pub fn nodes_announce(prefix: &str) -> String {
         format!("{prefix}.nodes.announce")
     }
 
+    #[must_use]
     pub fn nodes_discover(prefix: &str) -> String {
         format!("{prefix}.nodes.discover")
     }
@@ -39,11 +43,13 @@ impl VoiceToken {
         Ok(Self(format!("{:016x}", getrandom::u64()?)))
     }
 
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         let valid = s.len() == 16 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
         valid.then(|| Self(s.to_owned()))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -88,7 +94,7 @@ pub struct Ticket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeAnnounce {
     pub node_id: String,
-    /// `host:port` the tenant puts in VOICE_SERVER_UPDATE.
+    /// `host:port` the tenant puts in `VOICE_SERVER_UPDATE`.
     pub endpoint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub region: Option<String>,

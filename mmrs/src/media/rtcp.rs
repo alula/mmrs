@@ -71,7 +71,9 @@ pub fn write_rr(out: &mut Vec<u8>, sender_ssrc: u32, blocks: &[[u8; REPORT_BLOCK
         out.extend_from_slice(&[0x80 | chunk.len() as u8, RR]);
         out.extend_from_slice(&(words as u16).to_be_bytes());
         out.extend_from_slice(&sender_ssrc.to_be_bytes());
-        chunk.iter().for_each(|block| out.extend_from_slice(block));
+        for block in chunk {
+            out.extend_from_slice(block);
+        }
     }
 }
 

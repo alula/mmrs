@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -49,7 +50,7 @@ impl Rooms {
         user_id: String,
     ) -> (Membership, mpsc::UnboundedReceiver<Push>) {
         let (push, pushes) = mpsc::unbounded_channel();
-        let mut rooms = self.rooms.lock().unwrap();
+        let mut rooms = self.rooms.lock();
         let members = rooms.entry(key.clone()).or_default();
 
         let mut peers: Vec<Peer> = Vec::new();
@@ -66,11 +67,13 @@ impl Rooms {
             let _ = push.send(Push::Connected(peers));
         }
 
-        for member in others(members, &user_id) {
-            let _ = member.push.send(Push::Connected(vec![Peer {
-                user_id: user_id.clone(),
-                speaking: None,
-            }]));
+        if !members.values().any(|member| member.user_id == user_id) {
+            for member in others(members, &user_id) {
+                let _ = member.push.send(Push::Connected(vec![Peer {
+                    user_id: user_id.clone(),
+                    speaking: None,
+                }]));
+            }
         }
 
         members.insert(
@@ -99,7 +102,7 @@ pub struct Membership {
 
 impl Membership {
     pub fn set_speaking(&self, speaking: Speaking) {
-        let mut rooms = self.rooms.rooms.lock().unwrap();
+        let mut rooms = self.rooms.rooms.lock();
         let Some(members) = rooms.get_mut(&self.key) else {
             return;
         };
@@ -121,7 +124,7 @@ impl Membership {
 
 impl Drop for Membership {
     fn drop(&mut self) {
-        let mut rooms = self.rooms.rooms.lock().unwrap();
+        let mut rooms = self.rooms.rooms.lock();
 
         let Some(members) = rooms.get_mut(&self.key) else {
             return;
@@ -203,7 +206,7 @@ mod tests {
         );
 
         drop(a);
-        assert!(rooms.rooms.lock().unwrap().is_empty());
+        assert!(rooms.rooms.lock().is_empty());
     }
 
     #[test]
@@ -217,8 +220,11 @@ mod tests {
             new_rx.try_recv().unwrap(),
             Push::Connected(vec![peer("a", None)])
         );
-        a_rx.try_recv().unwrap();
-        a_rx.try_recv().unwrap();
+        assert_eq!(
+            a_rx.try_recv().unwrap(),
+            Push::Connected(vec![peer("b", None)])
+        );
+        assert!(a_rx.try_recv().is_err());
 
         drop(old);
         assert!(a_rx.try_recv().is_err());

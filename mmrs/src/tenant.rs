@@ -86,16 +86,15 @@ impl Tenant {
     }
 
     async fn publish_json(&self, subject: String, value: &impl serde::Serialize) {
-        let result = match serde_json::to_vec(value) {
-            Ok(payload) => self
-                .nats
-                .publish(subject, payload.into())
-                .await
-                .map_err(anyhow::Error::from),
-            Err(error) => Err(error.into()),
+        let payload = match serde_json::to_vec(value) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(%error, tenant = %self.name, "failed to serialize payload");
+                return;
+            }
         };
 
-        if let Err(error) = result {
+        if let Err(error) = self.nats.publish(subject, payload.into()).await {
             tracing::warn!(%error, tenant = %self.name, "failed to publish");
         }
     }

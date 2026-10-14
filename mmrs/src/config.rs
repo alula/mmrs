@@ -105,7 +105,7 @@ impl TenantConfig {
 /// Strips the port from `host:port`, `host` or `[ipv6]:port`.
 pub fn strip_port(host: &str) -> &str {
     if let Some(rest) = host.strip_prefix('[') {
-        return rest.split(']').next().unwrap_or(rest);
+        return rest.split_once(']').map_or(rest, |(addr, _)| addr);
     }
     host.rsplit_once(':').map_or(host, |(name, _)| name)
 }

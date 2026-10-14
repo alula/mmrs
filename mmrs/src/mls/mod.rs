@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use codec::{TlsReader, TlsWriter};
 
 const MLS10: u16 = 1;
-/// MLS_128_DHKEMP256_AES128GCM_SHA256_P256, the only suite DAVE uses.
+/// `MLS_128_DHKEMP256_AES128GCM_SHA256_P256`, the only suite DAVE uses.
 const CIPHER_SUITE: u16 = 2;
 const BASIC_CREDENTIAL: u16 = 1;
 
@@ -24,7 +24,7 @@ const LEAF_SOURCE_KEY_PACKAGE: u8 = 1;
 const LEAF_SOURCE_UPDATE: u8 = 2;
 const LEAF_SOURCE_COMMIT: u8 = 3;
 
-/// `opaque HashReference<V>`: KeyPackageRef and ProposalRef.
+/// `opaque HashReference<V>`: `KeyPackageRef` and `ProposalRef`.
 pub type Ref = [u8; 32];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -86,7 +86,7 @@ impl<'a> LeafNode<'a> {
 }
 
 pub struct KeyPackage<'a> {
-    /// The whole encoded KeyPackage, as embedded in an Add proposal.
+    /// The whole encoded `KeyPackage`, as embedded in an Add proposal.
     pub raw: &'a [u8],
     pub leaf: LeafNode<'a>,
     cipher_suite: u16,
@@ -96,7 +96,7 @@ pub struct KeyPackage<'a> {
 }
 
 impl<'a> KeyPackage<'a> {
-    /// A bare KeyPackage, as DAVE clients send it in op 26.
+    /// A bare `KeyPackage`, as DAVE clients send it in op 26.
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut reader = TlsReader::new(data);
         let key_package = Self::read(&mut reader)?;
@@ -168,13 +168,13 @@ impl<'a> KeyPackage<'a> {
 /// A commit from op 28, checked only as far as a server can without group
 /// secrets.
 pub struct Commit<'a> {
-    /// The whole MLSMessage, forwarded unchanged in op 29.
+    /// The whole `MLSMessage`, forwarded unchanged in op 29.
     pub raw: &'a [u8],
     pub group_id: &'a [u8],
     pub epoch: u64,
     pub sender_leaf: u32,
     pub proposal_refs: Vec<&'a [u8]>,
-    /// The committer's new leaf, if the commit has an UpdatePath.
+    /// The committer's new leaf, if the commit has an `UpdatePath`.
     pub path_leaf: Option<LeafNode<'a>>,
 }
 
@@ -274,7 +274,7 @@ impl<'a> Welcome<'a> {
     }
 }
 
-/// Op 28: a commit MLSMessage, then a bare Welcome if any bytes remain.
+/// Op 28: a commit `MLSMessage`, then a bare Welcome if any bytes remain.
 pub fn parse_commit_welcome(data: &[u8]) -> Option<(Commit<'_>, Option<Welcome<'_>>)> {
     let mut reader = TlsReader::new(data);
     let commit = Commit::read(&mut reader)?;
