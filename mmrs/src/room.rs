@@ -52,24 +52,27 @@ pub struct Resolution {
     pub height: u32,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
     pub user_id: String,
     pub speaking: Option<Speaking>,
+    pub video: Option<Video>,
 }
 
 /// Room changes delivered to a member's connection.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Push {
     Connected(Vec<Peer>),
     Disconnected { user_id: String },
     Speaking { user_id: String, speaking: Speaking },
+    Video { user_id: String, video: Video },
 }
 
 struct Member {
     user_id: String,
     speaking: Option<Speaking>,
-    push: mpsc::UnboundedSender<Push>,
+    video: Option<Video>,
+    push: mpsc::UnboundedSender<Push>, // todo: make it Arc<Push>?
 }
 
 /// Members are keyed by connection id, so iteration follows join order.
@@ -92,10 +95,14 @@ impl Rooms {
         let mut peers: Vec<Peer> = Vec::new();
         for member in others(members, &user_id) {
             match peers.iter_mut().find(|peer| peer.user_id == member.user_id) {
-                Some(peer) => peer.speaking = member.speaking,
+                Some(peer) => {
+                    peer.speaking = member.speaking;
+                    peer.video.clone_from(&member.video);
+                }
                 None => peers.push(Peer {
                     user_id: member.user_id.clone(),
                     speaking: member.speaking,
+                    video: member.video.clone(),
                 }),
             }
         }
@@ -108,6 +115,7 @@ impl Rooms {
                 let _ = member.push.send(Push::Connected(vec![Peer {
                     user_id: user_id.clone(),
                     speaking: None,
+                    video: None,
                 }]));
             }
         }
@@ -117,6 +125,7 @@ impl Rooms {
             Member {
                 user_id,
                 speaking: None,
+                video: None,
                 push,
             },
         );
@@ -137,7 +146,8 @@ pub struct Membership {
 }
 
 impl Membership {
-    pub fn set_speaking(&self, speaking: Speaking) {
+    /// Updates this member's state and pushes the change to the others.
+    fn update(&self, update: impl FnOnce(&mut Member) -> Push) {
         let mut rooms = self.rooms.rooms.lock();
         let Some(members) = rooms.get_mut(&self.key) else {
             return;
@@ -146,15 +156,31 @@ impl Membership {
             return;
         };
 
-        member.speaking = Some(speaking);
+        let push = update(member);
         let user_id = member.user_id.clone();
-
         for other in others(members, &user_id) {
-            let _ = other.push.send(Push::Speaking {
-                user_id: user_id.clone(),
-                speaking,
-            });
+            let _ = other.push.send(push.clone());
         }
+    }
+
+    pub fn set_speaking(&self, speaking: Speaking) {
+        self.update(|member| {
+            member.speaking = Some(speaking);
+            Push::Speaking {
+                user_id: member.user_id.clone(),
+                speaking,
+            }
+        });
+    }
+
+    pub fn set_video(&self, video: Video) {
+        self.update(|member| {
+            member.video = Some(video.clone());
+            Push::Video {
+                user_id: member.user_id.clone(),
+                video,
+            }
+        });
     }
 }
 

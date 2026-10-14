@@ -13,15 +13,15 @@ use tokio::time::{Instant, sleep_until};
 
 use super::close::CloseCode;
 use super::payload::{
-    self, ClientSpeaking, Frame, Identify, Resume, SelectProtocol, SpeakingState, StreamRequest,
-    UdpProtocolData,
+    self, ClientSpeaking, ClientVideo, Frame, Identify, Resume, SelectProtocol, SpeakingState,
+    StreamRequest, UdpProtocolData,
 };
 use super::resume::{ParkKey, Parking, Replay};
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
 use crate::media::{Leg, Offer, SinkWants};
-use crate::room::{Membership, Push, RoomKey, Speaking};
+use crate::room::{Membership, Push, RoomKey, Speaking, Video, VideoStream};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
 
@@ -248,6 +248,11 @@ impl Connection {
                 Ok(())
             }
             opcode::VIDEO => {
+                let client: ClientVideo = decode(frame.d)?;
+                if let Some(session) = &self.session {
+                    let video = video(session.leg.first_ssrc(), &session.layers, &client);
+                    session.membership.set_video(video);
+                }
                 Ok(())
             }
             opcode::MEDIA_SINK_WANTS => {
@@ -566,6 +571,9 @@ impl Connection {
                         },
                     )
                     .await?;
+                    if let Some(video) = &peer.video {
+                        self.send_video(user_id, video).await?;
+                    }
                 }
                 Ok(())
             }
@@ -577,6 +585,7 @@ impl Connection {
                 .await
             }
             Push::Speaking { user_id, speaking } => self.send_speaking(&user_id, speaking).await,
+            Push::Video { user_id, video } => self.send_video(&user_id, &video).await,
         }
     }
 
@@ -587,6 +596,17 @@ impl Connection {
             speaking: SpeakingState::for_version(self.version, speaking.flags),
         };
         self.send(opcode::SPEAKING, payload).await
+    }
+
+    async fn send_video(&mut self, user_id: &str, video: &Video) -> Result<(), End> {
+        let payload = payload::Video {
+            user_id,
+            audio_ssrc: video.audio_ssrc,
+            video_ssrc: video.video_ssrc,
+            rtx_ssrc: video.rtx_ssrc,
+            streams: &video.streams,
+        };
+        self.send(opcode::VIDEO, payload).await
     }
 
     async fn send(&mut self, op: u32, d: impl Serialize) -> Result<(), End> {
@@ -672,6 +692,51 @@ fn sink_wants(wants: &payload::MediaSinkWants) -> SinkWants {
         any: wants.any.unwrap_or(100),
         ssrcs,
     }
+}
+
+fn video(audio_ssrc: u32, layers: &[Layer], client: &ClientVideo) -> Video {
+    let has_video = client.video_ssrc.is_some();
+
+    let mut streams: Vec<VideoStream> = Vec::with_capacity(layers.len());
+    let mut video_ssrc = 0u32;
+    let mut rtx_ssrc = 0u32;
+
+    for layer in layers {
+        let stream = if let Some(stream) = client
+            .streams
+            .iter()
+            .find(|stream| stream.rid.as_deref() == Some(layer.rid.as_str()))
+        {
+            stream
+        } else {
+            continue;
+        };
+
+        let active = has_video && stream.active == Some(true);
+        if active {
+            video_ssrc = layer.ssrc;
+            rtx_ssrc = layer.ssrc + 1;
+        }
+
+        streams.push(VideoStream {
+            kind: stream.kind.clone().unwrap_or_else(|| "video".to_owned()),
+            rid: layer.rid.clone(),
+            ssrc: layer.ssrc,
+            rtx_ssrc: layer.ssrc + 1,
+            active,
+            quality: stream.quality.unwrap_or(layer.quality),
+            max_bitrate: stream.max_bitrate,
+            max_framerate: stream.max_framerate,
+            max_resolution: stream.max_resolution.clone(),
+        })
+    }
+
+    return Video {
+        audio_ssrc,
+        video_ssrc,
+        rtx_ssrc,
+        streams,
+    };
 }
 
 fn random<const N: usize>() -> [u8; N] {
