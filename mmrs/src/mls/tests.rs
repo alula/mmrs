@@ -11,7 +11,8 @@ const USER_A: u64 = 100000000000000001;
 const USER_B: u64 = 100000000000000002;
 const CHANNEL: u64 = 100000000000000010;
 
-/// The op 27 Add of B, split into the signed content and the signature.
+/// The DAVE_MLS_PROPOSALS Add of B, split into the signed content and the
+/// signature.
 struct Add<'a> {
     message: &'a [u8],
     content: &'a [u8],

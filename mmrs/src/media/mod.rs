@@ -26,7 +26,7 @@ use crate::media::discovery::{Discovery, ProtocolVersion};
 use crate::media::rtcp::ReceiveStats;
 use crate::media::rtp::{Packet, RTCP_HEADER_LEN, Rtp};
 use crate::media::webrtc::{Dtls, WebRtcLeg};
-use crate::room::RoomKey;
+use crate::room::{Codec, RoomKey};
 
 pub use webrtc::Offer;
 
@@ -84,6 +84,7 @@ struct LegState {
     wants: SinkWants,
     /// The video layers the client announced, while its video is on.
     video: Vec<u32>,
+    payload_types: Vec<PayloadTypes>,
     /// What MMRS received on the leg's media SSRCs, for receiver reports.
     received: BTreeMap<u32, ReceiveStats>,
 }
@@ -134,6 +135,20 @@ impl LegState {
         }
     }
 
+    fn codec(&self, payload_type: u8, rtx: bool) -> Option<Codec> {
+        self.payload_types
+            .iter()
+            .find(|types| types.payload_type_of(rtx) == Some(payload_type))
+            .map(|types| types.codec)
+    }
+
+    fn payload_type(&self, codec: Codec, rtx: bool) -> Option<u8> {
+        self.payload_types
+            .iter()
+            .find(|types| types.codec == codec)?
+            .payload_type_of(rtx)
+    }
+
     /// Encrypts `plain` for this leg's client, if it has a key and an
     /// address yet.
     fn seal(&mut self, plain: &[u8], header_len: usize) -> Option<(PacketBuf, SocketAddr)> {
@@ -147,8 +162,9 @@ impl LegState {
     }
 }
 
-/// What a client wants to receive (op 15). A quality of 0 means "do not
-/// forward"; browsers start from `any: 0` and list each stream they want.
+/// What a client wants to receive (MEDIA_SINK_WANTS). A quality of 0 means
+/// "do not forward"; browsers start from `any: 0` and list each stream they
+/// want.
 pub struct SinkWants {
     pub any: u8,
     pub ssrcs: HashMap<u32, u8>,
@@ -166,6 +182,22 @@ impl Default for SinkWants {
 impl SinkWants {
     fn wants(&self, ssrc: u32) -> bool {
         self.ssrcs.get(&ssrc).copied().unwrap_or(self.any) > 0
+    }
+}
+
+pub struct PayloadTypes {
+    pub codec: Codec,
+    pub payload_type: u8,
+    pub rtx_payload_type: Option<u8>,
+}
+
+impl PayloadTypes {
+    fn payload_type_of(&self, rtx: bool) -> Option<u8> {
+        if rtx {
+            self.rtx_payload_type
+        } else {
+            Some(self.payload_type)
+        }
     }
 }
 
@@ -192,7 +224,7 @@ struct Forward<'a> {
 #[derive(PartialEq, Eq)]
 enum ForwardKind {
     Audio,
-    Video,
+    Video { codec: Codec, rtx: bool },
     Rtcp,
 }
 
@@ -322,7 +354,11 @@ impl Media {
         let kind = if ssrc == sender.ssrcs.start {
             ForwardKind::Audio
         } else {
-            ForwardKind::Video
+            let rtx = sender.is_rtx(ssrc);
+            let Some(codec) = sender.codec(plain[1] & 0x7f, rtx) else {
+                return;
+            };
+            ForwardKind::Video { codec, rtx }
         };
         let Some(members) = rooms.get(&sender.room) else {
             return;
@@ -354,6 +390,7 @@ impl Media {
             ForwardKind::Audio => Rtp::parse(forward.plain),
             _ => None,
         };
+        let mut renumbered = PacketBuf::new();
         for &id in members.iter().filter(|&&id| id != sender_id) {
             let leg = legs.get_mut(&id).expect("room member exists");
             if !leg.wants.wants(forward.ssrc) {
@@ -364,7 +401,25 @@ impl Media {
                     webrtc.send_audio(forward.ssrc, rtp, Instant::now());
                     self.poll_webrtc(webrtc, id, received);
                 }
-            } else if let Some((sealed, addr)) = leg.seal(forward.plain, forward.header_len) {
+                continue;
+            }
+
+            let mut plain = forward.plain;
+            if let ForwardKind::Video { codec, rtx } = forward.kind {
+                let Some(payload_type) = leg.payload_type(codec, rtx) else {
+                    continue;
+                };
+                if payload_type != forward.plain[1] & 0x7f {
+                    if renumbered.is_empty() {
+                        renumbered
+                            .try_extend_from_slice(forward.plain)
+                            .expect("received packets fit a packet buffer");
+                    }
+                    renumbered[1] = forward.plain[1] & 0x80 | payload_type;
+                    plain = &renumbered;
+                }
+            }
+            if let Some((sealed, addr)) = leg.seal(plain, forward.header_len) {
                 self.send(&sealed, addr);
             }
         }
@@ -629,6 +684,7 @@ impl Media {
                 transport: None,
                 wants: SinkWants::default(),
                 video: Vec::new(),
+                payload_types: Vec::new(),
                 received: BTreeMap::new(),
             },
         );
@@ -719,7 +775,7 @@ impl Leg {
     }
 
     /// Switches the leg to the `webrtc` protocol, reachable at `ip`, and
-    /// returns the SDP for op 4.
+    /// returns the SDP for SESSION_DESCRIPTION.
     pub fn select_webrtc(&self, offer: Offer, ip: IpAddr) -> Result<String, RtcError> {
         let local = SocketAddr::new(ip, self.media.port);
         let mut legs = self.media.legs.lock();
@@ -742,6 +798,12 @@ impl Leg {
         return Ok(sdp_answer(local, &ice, &self.media.dtls.fingerprint));
     }
 
+    pub fn set_payload_types(&self, payload_types: Vec<PayloadTypes>) {
+        let mut legs = self.media.legs.lock();
+        let leg = legs.by_id.get_mut(&self.id).expect("open leg exists");
+        leg.payload_types = payload_types;
+    }
+
     pub fn set_wants(&self, wants: SinkWants) {
         let mut legs = self.media.legs.lock();
         let leg = legs.by_id.get_mut(&self.id).expect("open leg exists");
@@ -750,7 +812,7 @@ impl Leg {
         self.media.send_video_receivers(&mut legs, &room);
     }
 
-    /// The video layer SSRCs the client announced in op 12, or none while
+    /// The video layer SSRCs the client announced in VIDEO, or none while
     /// its video is off.
     pub fn set_video(&self, layers: Vec<u32>) {
         let mut guard = self.media.legs.lock();

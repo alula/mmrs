@@ -125,6 +125,59 @@ async fn forwards_rtp_between_udp_legs() {
     assert_eq!(b.cipher.open(&forwarded, 12).unwrap().as_slice(), rtp);
 }
 
+fn video(ssrc: u32, seq: u16, payload_type: u8, marker: bool) -> Vec<u8> {
+    let mut rtp = vec![0x80, u8::from(marker) << 7 | payload_type];
+    rtp.extend_from_slice(&seq.to_be_bytes());
+    rtp.extend_from_slice(&3000u32.to_be_bytes());
+    rtp.extend_from_slice(&ssrc.to_be_bytes());
+    rtp.extend_from_slice(&[0x90, 0xe0, 0x80, 0x01]);
+    rtp
+}
+
+fn payload_types(codec: Codec, payload_type: u8) -> PayloadTypes {
+    PayloadTypes {
+        codec,
+        payload_type,
+        rtx_payload_type: Some(payload_type + 1),
+    }
+}
+
+#[tokio::test]
+async fn renumbers_video_per_receiver() {
+    let (_media, clients) = clients(2).await;
+    let [a, b] = &clients[..] else { unreachable!() };
+    let layer = a.leg.first_ssrc() + 1;
+
+    a.leg.set_payload_types(vec![
+        payload_types(Codec::Av1, 101),
+        payload_types(Codec::H264, 105),
+    ]);
+    b.leg.set_payload_types(vec![
+        payload_types(Codec::H264, 103),
+        payload_types(Codec::Vp8, 96),
+    ]);
+
+    let sent = [
+        video(layer, 1, 101, true),
+        video(layer, 2, 105, true),
+        video(layer + 1, 1, 106, false),
+    ];
+    for (n4, rtp) in sent.iter().enumerate() {
+        a.socket
+            .send(&a.cipher.seal(rtp, 12, n4 as u32).unwrap())
+            .await
+            .unwrap();
+    }
+
+    // AV1 is skipped: b has no payload type for it.
+    let media = b.cipher.open(&recv(&b.socket).await, 12).unwrap();
+    assert_eq!(media[1], 0x80 | 103);
+    assert_eq!(media[2..], sent[1][2..]);
+    let rtx = b.cipher.open(&recv(&b.socket).await, 12).unwrap();
+    assert_eq!(rtx[1], 104);
+    assert_eq!(rtx[2..], sent[2][2..]);
+}
+
 #[tokio::test]
 async fn terminates_rtcp_per_leg() {
     let (media, clients) = clients(2).await;
@@ -229,7 +282,8 @@ impl Browser {
         (Self { rtc, socket }, fragment)
     }
 
-    /// Applies the op 4 SDP the way the web client's fabricated answer does.
+    /// Applies the SESSION_DESCRIPTION SDP the way the web client's
+    /// fabricated answer does.
     fn answer(&mut self, sdp: &str, server: SocketAddr, native_ssrc: u32) {
         let attribute = |name: &str| {
             sdp.lines()

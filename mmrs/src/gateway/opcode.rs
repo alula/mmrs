@@ -11,6 +11,7 @@ pub const RESUMED: u32 = 9;
 pub const CLIENTS_CONNECT: u32 = 11;
 pub const VIDEO: u32 = 12;
 pub const CLIENT_DISCONNECT: u32 = 13;
+pub const SESSION_UPDATE: u32 = 14;
 pub const MEDIA_SINK_WANTS: u32 = 15;
 pub const VOICE_BACKEND_VERSION: u32 = 16;
 pub const CLIENT_FLAGS: u32 = 18;
@@ -23,6 +24,7 @@ pub fn is_sequenced(op: u32) -> bool {
             | CLIENTS_CONNECT
             | VIDEO
             | CLIENT_DISCONNECT
+            | SESSION_UPDATE
             | MEDIA_SINK_WANTS
             | CLIENT_FLAGS
             | PLATFORM

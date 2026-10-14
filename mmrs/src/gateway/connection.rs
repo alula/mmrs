@@ -20,8 +20,8 @@ use super::resume::{ParkKey, Parking, Replay};
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
-use crate::media::{Leg, Offer, SinkWants};
-use crate::room::{Membership, Push, RoomKey, Speaking, Video, VideoStream};
+use crate::media::{Leg, Offer, PayloadTypes, SinkWants};
+use crate::room::{Codec, CodecSupport, Membership, Push, RoomKey, Speaking, Video, VideoStream};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
 
@@ -458,16 +458,18 @@ impl Connection {
             return Ok(());
         }
 
-        let video_codec = select
-            .codecs
-            .iter()
-            .filter(|codec| codec.kind == "video")
-            .min_by_key(|codec| codec.priority)
-            .map_or_else(|| "H264".to_owned(), |codec| codec.name.clone());
+        let Some(session) = &self.session else {
+            return Err(End::protocol(CloseCode::NotAuthenticated));
+        };
+
+        let (video_codecs, payload_types) = client_codecs(&select.codecs);
+        session.leg.set_payload_types(payload_types);
+
+        let video_codec = session.membership.set_video_codecs(video_codecs);
 
         let mut description = payload::SessionDescription {
             audio_codec: "opus",
-            video_codec,
+            video_codec: video_codec.name(),
             media_session_id: hex(&random::<16>()),
             dave_protocol_version: 0,
             mode: None,
@@ -591,6 +593,13 @@ impl Connection {
             }
             Push::Speaking { user_id, speaking } => self.send_speaking(&user_id, speaking).await,
             Push::Video { user_id, video } => self.send_video(&user_id, &video).await,
+            Push::VideoCodec(codec) => {
+                let update = payload::SessionUpdate {
+                    audio_codec: "opus",
+                    video_codec: codec.name(),
+                };
+                self.send(opcode::SESSION_UPDATE, update).await
+            }
         }
     }
 
@@ -699,6 +708,35 @@ fn sink_wants(wants: &payload::MediaSinkWants) -> SinkWants {
     }
 }
 
+fn client_codecs(codecs: &[payload::Codec]) -> (Vec<CodecSupport>, Vec<PayloadTypes>) {
+    let mut video_codecs = Vec::with_capacity(codecs.len());
+    let mut payload_types = Vec::with_capacity(codecs.len());
+
+    for client in codecs {
+        let Some(codec) = Codec::from_name(&client.name) else {
+            continue;
+        };
+        let Some(payload_type) = client.payload_type.filter(|&pt| pt < 128) else {
+            continue;
+        };
+        if client.kind == "video" {
+            video_codecs.push(CodecSupport {
+                codec,
+                priority: client.priority,
+                encode: client.encode,
+                decode: client.decode,
+            });
+        }
+        payload_types.push(PayloadTypes {
+            codec,
+            payload_type,
+            rtx_payload_type: client.rtx_payload_type.filter(|&pt| pt < 128),
+        });
+    }
+
+    return (video_codecs, payload_types);
+}
+
 fn video(audio_ssrc: u32, layers: &[Layer], client: &ClientVideo) -> Video {
     let has_video = client.video_ssrc.is_some();
 
@@ -758,8 +796,9 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// v8 acks `{t}`; older versions echo the nonce. Every version gets op 6,
-/// since clients answer a server op 3 with another heartbeat.
+/// v8 acks `{t}`; older versions echo the nonce. Every version gets
+/// HEARTBEAT_ACK, since clients answer a server HEARTBEAT with another
+/// heartbeat.
 fn heartbeat_ack(version: u8, d: Value) -> Value {
     match d.get("t") {
         Some(t) if version >= 8 => serde_json::json!({ "t": t }),

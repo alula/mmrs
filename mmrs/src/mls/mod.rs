@@ -96,7 +96,7 @@ pub struct KeyPackage<'a> {
 }
 
 impl<'a> KeyPackage<'a> {
-    /// A bare `KeyPackage`, as DAVE clients send it in op 26.
+    /// A bare `KeyPackage`, as DAVE clients send it in DAVE_MLS_KEY_PACKAGE.
     pub fn parse(data: &'a [u8]) -> Option<Self> {
         let mut reader = TlsReader::new(data);
         let key_package = Self::read(&mut reader)?;
@@ -165,10 +165,11 @@ impl<'a> KeyPackage<'a> {
     }
 }
 
-/// A commit from op 28, checked only as far as a server can without group
-/// secrets.
+/// A commit from DAVE_MLS_COMMIT_WELCOME, checked only as far as a server
+/// can without group secrets.
 pub struct Commit<'a> {
-    /// The whole `MLSMessage`, forwarded unchanged in op 29.
+    /// The whole `MLSMessage`, forwarded unchanged in
+    /// DAVE_MLS_ANNOUNCE_COMMIT_TRANSITION.
     pub raw: &'a [u8],
     pub group_id: &'a [u8],
     pub epoch: u64,
@@ -258,7 +259,7 @@ impl<'a> Welcome<'a> {
         self.secrets.iter().map(|&(new_member, _)| new_member)
     }
 
-    /// The Welcome with only `new_member`'s secrets, for op 30.
+    /// The Welcome with only `new_member`'s secrets, for DAVE_MLS_WELCOME.
     pub fn for_member(&self, new_member: &[u8]) -> Option<Vec<u8>> {
         let &(_, entry) = self
             .secrets
@@ -289,7 +290,7 @@ pub fn parse_commit_welcome(data: &[u8]) -> Option<(Commit<'_>, Option<Welcome<'
     Some((commit, Some(welcome)))
 }
 
-/// A signed proposal from the external sender, ready for op 27.
+/// A signed proposal from the external sender, ready for DAVE_MLS_PROPOSALS.
 pub struct Proposal {
     pub message: Vec<u8>,
     pub reference: Ref,
@@ -298,7 +299,7 @@ pub struct Proposal {
 /// The voice gateway as the group's only external sender.
 pub struct ExternalSender {
     key: SigningKey,
-    /// The encoded `ExternalSender` struct, sent as op 25.
+    /// The encoded `ExternalSender` struct, sent as DAVE_MLS_EXTERNAL_SENDER.
     pub encoded: Vec<u8>,
 }
 

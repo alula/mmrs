@@ -109,6 +109,12 @@ pub struct Codec {
     pub kind: String,
     #[serde(default)]
     pub priority: i64,
+    pub payload_type: Option<u8>,
+    pub rtx_payload_type: Option<u8>,
+    #[serde(default = "bool_true")]
+    pub encode: bool,
+    #[serde(default = "bool_true")]
+    pub decode: bool,
 }
 
 #[derive(Deserialize)]
@@ -121,7 +127,7 @@ pub struct UdpProtocolData {
 #[derive(Serialize)]
 pub struct SessionDescription {
     pub audio_codec: &'static str,
-    pub video_codec: String,
+    pub video_codec: &'static str,
     pub media_session_id: String,
     pub dave_protocol_version: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,6 +136,12 @@ pub struct SessionDescription {
     pub secret_key: Option<[u8; 32]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sdp: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SessionUpdate {
+    pub audio_codec: &'static str,
+    pub video_codec: &'static str,
 }
 
 /// Keys are `any` or an SSRC in decimal, values a quality from 0 to 100.
@@ -261,6 +273,10 @@ fn optional_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Stri
     return Ok(Option::<RawId>::deserialize(deserializer)?.map(String::from));
 }
 
+fn bool_true() -> bool {
+    return true;
+}
+
 fn nonzero<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<NonZeroU32>, D::Error> {
     return Ok(NonZeroU32::new(u32::deserialize(deserializer)?));
 }
@@ -282,6 +298,58 @@ mod tests {
         assert_eq!(identify.user_id, "123456789012345678");
         assert_eq!(identify.channel_id, None);
         assert!(identify.streams.is_empty());
+    }
+
+    #[test]
+    fn codecs_from_native() {
+        let select: SelectProtocol = serde_json::from_value(serde_json::json!({
+            "protocol": "udp",
+            "codecs": [
+                {"name": "opus", "type": "audio", "priority": 1000, "payload_type": 120},
+                {"name": "AV1", "type": "video", "priority": 1000, "payload_type": 101,
+                 "rtx_payload_type": 102, "encode": false, "decode": true},
+            ],
+        }))
+        .unwrap();
+
+        let [opus, av1] = &select.codecs[..] else {
+            panic!("two codecs");
+        };
+        assert_eq!(
+            (opus.payload_type, opus.rtx_payload_type),
+            (Some(120), None)
+        );
+        assert_eq!(av1.kind, "video");
+        assert_eq!(
+            (av1.payload_type, av1.rtx_payload_type),
+            (Some(101), Some(102))
+        );
+        assert_eq!((av1.encode, av1.decode), (false, true));
+    }
+
+    #[test]
+    fn codecs_from_browser() {
+        let select: SelectProtocol = serde_json::from_value(serde_json::json!({
+            "protocol": "webrtc",
+            "codecs": [
+                {"name": "opus", "type": "audio", "priority": 1000, "payload_type": 111,
+                 "rtx_payload_type": null},
+                {"name": "H264", "type": "video", "priority": 1000, "payload_type": 103,
+                 "rtx_payload_type": 104},
+            ],
+        }))
+        .unwrap();
+
+        let [opus, h264] = &select.codecs[..] else {
+            panic!("two codecs");
+        };
+        assert_eq!(opus.rtx_payload_type, None);
+        assert_eq!(h264.priority, 1000);
+        assert_eq!(
+            (h264.payload_type, h264.rtx_payload_type),
+            (Some(103), Some(104))
+        );
+        assert!(h264.encode && h264.decode);
     }
 
     #[test]
