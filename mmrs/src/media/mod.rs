@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use arrayvec::ArrayVec;
+use parking_lot::Mutex;
 use str0m::config::Fingerprint;
 use str0m::rtp::RtpPacket;
 use str0m::{IceCreds, RtcError};
-use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
@@ -75,12 +75,15 @@ struct Legs {
 /// One client's side of the media plane.
 struct LegState {
     room: RoomKey,
+    user_id: u64,
     ssrcs: Range<u32>,
     /// Where media for this client goes. Learned from IP discovery, then
     /// moved by authenticated packets, since native clients rotate sockets.
     addr: Option<SocketAddr>,
     transport: Option<Transport>,
     wants: SinkWants,
+    /// The video layers the client announced, while its video is on.
+    video: Vec<u32>,
     /// What MMRS received on the leg's media SSRCs, for receiver reports.
     received: BTreeMap<u32, ReceiveStats>,
 }
@@ -111,17 +114,12 @@ impl LegState {
 
     /// Discord reports audio with the client's audio SSRC as sender and
     /// video with the first video SSRC.
-    fn receiver_reports(&mut self, now: Instant) -> Option<Vec<u8>> {
-        if self.received.is_empty() {
-            return None;
-        }
-
+    fn write_receiver_reports(&mut self, out: &mut Vec<u8>, now: Instant) {
         let audio = self.ssrcs.start;
-        let mut compound = Vec::new();
 
         if let Some(stats) = self.received.get_mut(&audio) {
             let block = stats.report_block(audio, now);
-            rtcp::write_rr(&mut compound, audio, &[block]);
+            rtcp::write_rr(out, audio, &[block]);
         }
 
         let video_blocks: Vec<_> = self
@@ -132,10 +130,8 @@ impl LegState {
             .collect();
 
         if !video_blocks.is_empty() {
-            rtcp::write_rr(&mut compound, audio + 1, &video_blocks);
+            rtcp::write_rr(out, audio + 1, &video_blocks);
         }
-
-        Some(compound)
     }
 
     /// Encrypts `plain` for this leg's client, if it has a key and an
@@ -570,21 +566,50 @@ impl Media {
     }
 
     fn send_reports(&self, now: Instant) {
-        let mut legs = self.legs.lock();
-        for leg in legs.by_id.values_mut() {
-            let Some(compound) = leg.receiver_reports(now) else {
-                continue;
-            };
-            if let Some((sealed, addr)) = leg.seal(&compound, RTCP_HEADER_LEN) {
-                self.send(&sealed, addr);
+        let mut guard = self.legs.lock();
+        let Legs { by_id, rooms, .. } = &mut *guard;
+        let mut compound = Vec::new();
+
+        // Every leg is in a room, and walking rooms leaves `by_id` free to
+        // borrow per leg.
+        for members in rooms.values() {
+            for &id in members {
+                compound.clear();
+                let leg = by_id.get_mut(&id).expect("room member exists");
+                leg.write_receiver_reports(&mut compound, now);
+                write_video_receivers(by_id, members, id, &mut compound);
+                self.send_rtcp(by_id, id, &compound);
             }
         }
     }
 
+    fn send_video_receivers(&self, legs: &mut Legs, room: &RoomKey) {
+        let Legs { by_id, rooms, .. } = legs;
+        let Some(members) = rooms.get(room) else {
+            return;
+        };
+
+        let mut compound = Vec::new();
+        for &id in members {
+            compound.clear();
+            write_video_receivers(by_id, members, id, &mut compound);
+            self.send_rtcp(by_id, id, &compound);
+        }
+    }
+
+    fn send_rtcp(&self, legs: &mut HashMap<u64, LegState>, id: u64, compound: &[u8]) {
+        if compound.is_empty() {
+            return;
+        }
+        let leg = legs.get_mut(&id).expect("listed leg exists");
+        if let Some((sealed, addr)) = leg.seal(compound, RTCP_HEADER_LEN) {
+            self.send(&sealed, addr);
+        }
+    }
 
     /// Allocates `count` consecutive SSRCs, none of them 0, for a client in
     /// `room`.
-    pub fn open_leg(self: &Arc<Self>, room: RoomKey, count: u32) -> Leg {
+    pub fn open_leg(self: &Arc<Self>, room: RoomKey, user_id: u64, count: u32) -> Leg {
         let first = allocate(&self.next_ssrc, count);
         let ssrcs = first..first + count;
 
@@ -597,14 +622,17 @@ impl Media {
         legs.by_id.insert(
             id,
             LegState {
-                room,
+                room: room.clone(),
+                user_id,
                 ssrcs,
                 addr: None,
                 transport: None,
                 wants: SinkWants::default(),
+                video: Vec::new(),
                 received: BTreeMap::new(),
             },
         );
+        self.send_video_receivers(&mut legs, &room);
 
         Leg {
             media: self.clone(),
@@ -612,7 +640,29 @@ impl Media {
             first_ssrc: first,
         }
     }
+}
 
+/// One `0SID` per video layer of a native leg, naming the other users in
+/// `members` that want it. Bitrate and loss stay 0 until MMRS measures them.
+fn write_video_receivers(
+    legs: &HashMap<u64, LegState>,
+    members: &HashSet<u64>,
+    id: u64,
+    out: &mut Vec<u8>,
+) {
+    let sender = &legs[&id];
+    let Some(Transport::Udp(_)) = sender.transport else {
+        return;
+    };
+
+    for &layer in &sender.video {
+        let blocks = members
+            .iter()
+            .map(|member| &legs[member])
+            .filter(|leg| leg.user_id != sender.user_id && leg.wants.wants(layer))
+            .map(|leg| rtcp::make_dis0_block(leg.user_id, 0, 0));
+        rtcp::write_dis0_blocks(out, layer, blocks);
+    }
 }
 
 /// Decrypts a packet from the leg's client and moves the leg's address to
@@ -694,7 +744,26 @@ impl Leg {
 
     pub fn set_wants(&self, wants: SinkWants) {
         let mut legs = self.media.legs.lock();
-        legs.by_id.get_mut(&self.id).expect("open leg exists").wants = wants;
+        let leg = legs.by_id.get_mut(&self.id).expect("open leg exists");
+        leg.wants = wants;
+        let room = leg.room.clone();
+        self.media.send_video_receivers(&mut legs, &room);
+    }
+
+    /// The video layer SSRCs the client announced in op 12, or none while
+    /// its video is off.
+    pub fn set_video(&self, layers: Vec<u32>) {
+        let mut guard = self.media.legs.lock();
+        let Legs { by_id, rooms, .. } = &mut *guard;
+        let leg = by_id.get_mut(&self.id).expect("open leg exists");
+        leg.video = layers;
+        let Some(members) = rooms.get(&leg.room) else {
+            return;
+        };
+
+        let mut compound = Vec::new();
+        write_video_receivers(by_id, members, self.id, &mut compound);
+        self.media.send_rtcp(by_id, self.id, &compound);
     }
 }
 
@@ -728,6 +797,7 @@ impl Drop for Leg {
                 legs.rooms.remove(&leg.room);
             }
         }
+        self.media.send_video_receivers(legs, &leg.room);
     }
 }
 

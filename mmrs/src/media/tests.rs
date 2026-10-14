@@ -72,8 +72,8 @@ async fn clients(count: usize) -> (Arc<Media>, Vec<Client>) {
     };
     let mode = EncryptionMode::AeadAes256GcmRtpsize;
     let mut clients = Vec::new();
-    for _ in 0..count {
-        let leg = media.open_leg(room.clone(), 3);
+    for user_id in 1..=count as u64 {
+        let leg = media.open_leg(room.clone(), user_id, 3);
         let cipher = Cipher::new(mode, &leg.select_udp(mode, None));
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         socket.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
@@ -179,6 +179,28 @@ async fn terminates_rtcp_per_leg() {
     assert_eq!(rr[24..28], [0x0a, 0x0b, 0x0c, 0x0d]);
 }
 
+#[tokio::test]
+async fn reports_video_receivers_to_native_senders() {
+    let (_media, clients) = clients(2).await;
+    let [a, b] = &clients[..] else { unreachable!() };
+    let layer = a.leg.first_ssrc() + 1;
+
+    a.leg.set_video(vec![layer]);
+    let sid = a.cipher.open(&recv(&a.socket).await, 8).unwrap();
+    assert_eq!(sid[..4], [0x81, 0xcc, 0x00, 0x05]);
+    assert_eq!(sid[4..12], [&layer.to_be_bytes()[..], b"0SID"].concat());
+    assert_eq!(sid[12..20], 2u64.to_be_bytes());
+    assert_eq!(sid[20..], [0; 4]);
+
+    b.leg.set_wants(SinkWants {
+        any: 100,
+        ssrcs: HashMap::from([(layer, 0)]),
+    });
+    let sid = a.cipher.open(&recv(&a.socket).await, 8).unwrap();
+    assert_eq!(sid[..4], [0x80, 0xcc, 0x00, 0x02]);
+    assert_eq!(sid[4..], [&layer.to_be_bytes()[..], b"0SID"].concat());
+}
+
 struct Browser {
     rtc: Rtc,
     socket: UdpSocket,
@@ -277,7 +299,7 @@ async fn bridges_browser_and_native_audio() {
         tenant: "t".into(),
         room: "r".into(),
     };
-    let leg = media.open_leg(room, 3);
+    let leg = media.open_leg(room, 9, 3);
     let (mut browser, fragment) = Browser::new().await;
     let sdp = leg
         .select_webrtc(Offer::parse(&fragment).unwrap(), Ipv4Addr::LOCALHOST.into())

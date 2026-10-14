@@ -251,6 +251,12 @@ impl Connection {
                 let client: ClientVideo = decode(frame.d)?;
                 if let Some(session) = &self.session {
                     let video = video(session.leg.first_ssrc(), &session.layers, &client);
+                    let layers = if video.streams.iter().any(|stream| stream.active) {
+                        video.streams.iter().map(|stream| stream.ssrc).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    session.leg.set_video(layers);
                     session.membership.set_video(video);
                 }
                 Ok(())
@@ -308,6 +314,7 @@ impl Connection {
         {
             return Err(auth_failed());
         }
+        let user_id = ticket.user_id.parse().map_err(|_| auth_failed())?;
 
         if identify.streams.len() > MAX_STREAMS {
             return Err(End::protocol(CloseCode::BadRequest));
@@ -335,10 +342,8 @@ impl Connection {
             tenant: self.tenant.name().clone(),
             room: ticket.room.clone(),
         };
-        let leg = self
-            .state
-            .media
-            .open_leg(room.clone(), 1 + 2 * identify.streams.len() as u32);
+        let count = 1 + 2 * identify.streams.len() as u32;
+        let leg = self.state.media.open_leg(room.clone(), user_id, count);
         let ready = self.ready(leg.first_ssrc(), identify.streams);
         let layers = ready
             .streams
@@ -713,7 +718,7 @@ fn video(audio_ssrc: u32, layers: &[Layer], client: &ClientVideo) -> Video {
         };
 
         let active = has_video && stream.active == Some(true);
-        if active {
+        if active && video_ssrc == 0 {
             video_ssrc = layer.ssrc;
             rtx_ssrc = layer.ssrc + 1;
         }

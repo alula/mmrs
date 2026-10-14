@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 pub const SR: u8 = 200;
 pub const RR: u8 = 201;
+pub const APP: u8 = 204;
 pub const RTPFB: u8 = 205;
 pub const PSFB: u8 = 206;
 
@@ -15,6 +16,8 @@ pub const FMT_PLI: u8 = 1;
 const SR_LEN: usize = 28;
 const REPORT_BLOCK_LEN: usize = 24;
 const MAX_REPORT_BLOCKS: usize = 31;
+const DIS0_HEADER_LEN: usize = 12;
+const DIS0_BLOCK_LEN: usize = 12;
 
 /// The packets of a compound, up to the first malformed one.
 pub fn packets(compound: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -66,6 +69,8 @@ pub fn strip_report_blocks(sr: &[u8]) -> Option<[u8; SR_LEN]> {
 }
 
 pub fn write_rr(out: &mut Vec<u8>, sender_ssrc: u32, blocks: &[[u8; REPORT_BLOCK_LEN]]) {
+    let packets = blocks.len().div_ceil(MAX_REPORT_BLOCKS);
+    out.reserve(packets * 8 + blocks.len() * REPORT_BLOCK_LEN);
     for chunk in blocks.chunks(MAX_REPORT_BLOCKS) {
         let words = 1 + chunk.len() * REPORT_BLOCK_LEN / 4;
         out.extend_from_slice(&[0x80 | chunk.len() as u8, RR]);
@@ -75,6 +80,51 @@ pub fn write_rr(out: &mut Vec<u8>, sender_ssrc: u32, blocks: &[[u8; REPORT_BLOCK
             out.extend_from_slice(block);
         }
     }
+}
+
+pub fn make_dis0_block(user_id: u64, bitrate: u32, fraction_lost: u8) -> [u8; DIS0_BLOCK_LEN] {
+    let exp = (u32::BITS - bitrate.leading_zeros()).saturating_sub(18);
+    let packed = (exp << 26) | ((bitrate >> exp) << 8) | u32::from(fraction_lost);
+
+    let mut block = [0; DIS0_BLOCK_LEN];
+    block[0..8].copy_from_slice(&user_id.to_be_bytes());
+    block[8..12].copy_from_slice(&packed.to_be_bytes());
+    block
+}
+
+pub fn write_dis0_blocks(
+    out: &mut Vec<u8>,
+    layer_ssrc: u32,
+    blocks: impl IntoIterator<Item = [u8; DIS0_BLOCK_LEN]>,
+) {
+    let blocks = blocks.into_iter();
+    let most = blocks.size_hint().1.unwrap_or(MAX_REPORT_BLOCKS);
+    out.reserve(DIS0_HEADER_LEN + most.min(MAX_REPORT_BLOCKS) * DIS0_BLOCK_LEN);
+
+    let start = out.len();
+    out.extend_from_slice(&[0x80, APP, 0, 0]);
+    out.extend_from_slice(&layer_ssrc.to_be_bytes());
+    out.extend_from_slice(b"0SID");
+
+    let mut count = 0;
+    for block in blocks {
+        if count == MAX_REPORT_BLOCKS {
+            break;
+        }
+        let written = &out[start + DIS0_HEADER_LEN..];
+        if written
+            .chunks_exact(DIS0_BLOCK_LEN)
+            .any(|other| other[..8] == block[..8])
+        {
+            continue;
+        }
+        out.extend_from_slice(&block);
+        count += 1;
+    }
+
+    let words = 2 + count * DIS0_BLOCK_LEN / 4;
+    out[start] |= count as u8;
+    out[start + 2..start + 4].copy_from_slice(&(words as u16).to_be_bytes());
 }
 
 /// Reception statistics of one incoming SSRC (RFC 3550 appendix A.1, A.3,
@@ -231,6 +281,41 @@ mod tests {
 
         assert_eq!(out[..8], [0x81, 0xc9, 0x00, 0x07, 0, 0, 0, 9]);
         assert_eq!(out.len(), 32);
+        assert_eq!(packets(&out).count(), 1);
+    }
+
+    #[test]
+    fn writes_video_receivers() {
+        let blocks = [
+            make_dis0_block(409988776655443322, 1_500_000, 0),
+            make_dis0_block(302211009988776655, 1_500_000, 0),
+        ];
+        let mut out = Vec::new();
+        write_dis0_blocks(&mut out, 44505, blocks);
+
+        let header = [
+            0x82, 0xcc, 0x00, 0x08, 0x00, 0x00, 0xad, 0xd9, 0x30, 0x53, 0x49, 0x44,
+        ];
+        assert_eq!(out[..12], header);
+        let first = [
+            0x05, 0xb0, 0x92, 0x9e, 0xc2, 0x71, 0xd5, 0x7a, 0x0e, 0xdc, 0x6c, 0x00,
+        ];
+        assert_eq!(out[12..24], first);
+        let second = [
+            0x04, 0x31, 0xab, 0x4f, 0xf9, 0x97, 0xd2, 0xcf, 0x0e, 0xdc, 0x6c, 0x00,
+        ];
+        assert_eq!(out[24..], second);
+    }
+
+    #[test]
+    fn writes_empty_video_receivers() {
+        let mut out = Vec::new();
+        write_dis0_blocks(&mut out, 44505, []);
+
+        let header = [
+            0x80, 0xcc, 0x00, 0x02, 0x00, 0x00, 0xad, 0xd9, 0x30, 0x53, 0x49, 0x44,
+        ];
+        assert_eq!(out, header);
         assert_eq!(packets(&out).count(), 1);
     }
 }
