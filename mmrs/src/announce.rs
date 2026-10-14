@@ -22,7 +22,7 @@ async fn run(state: Arc<AppState>, tenant: Arc<Tenant>) {
     let mut discover = match tenant.subscribe_discover().await {
         Ok(subscriber) => Some(subscriber),
         Err(error) => {
-            tracing::warn!(%error, tenant = %tenant.name, "failed to subscribe to node discovery");
+            tracing::warn!(%error, tenant = %tenant.name(), "failed to subscribe to node discovery");
             None
         }
     };
@@ -57,7 +57,7 @@ async fn next(subscriber: &mut Option<async_nats::Subscriber>) -> Option<async_n
 fn announcement(state: &AppState, tenant: &Tenant, node_state: NodeState) -> NodeAnnounce {
     NodeAnnounce {
         node_id: state.config.node_id.clone(),
-        endpoint: tenant.endpoint.clone(),
+        endpoint: tenant.endpoint().clone(),
         region: state.config.region.clone(),
         state: node_state,
         participants: state.sessions.count() as u32,

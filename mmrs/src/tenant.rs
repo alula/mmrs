@@ -10,15 +10,25 @@ use crate::config::{TenantConfig, strip_port};
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Tenant {
-    pub name: String,
-    pub endpoint: String,
+    pub config: Arc<TenantConfig>,
     node_id: String,
-    prefix: String,
     nats: async_nats::Client,
 }
 
 impl Tenant {
-    async fn connect(config: &TenantConfig, node_id: &str) -> anyhow::Result<Self> {
+    pub fn name(&self) -> &String {
+        &self.config.name
+    }
+
+    pub fn endpoint(&self) -> &String {
+        &self.config.endpoint
+    }
+
+    pub fn prefix(&self) -> &String {
+        &self.config.subject_prefix
+    }
+
+    async fn connect(config: Arc<TenantConfig>, node_id: &str) -> anyhow::Result<Self> {
         let mut options = async_nats::ConnectOptions::new()
             .name(format!("mmrs {node_id}"))
             .request_timeout(Some(RESOLVE_TIMEOUT))
@@ -37,10 +47,8 @@ impl Tenant {
             .with_context(|| format!("tenant {}: connecting to NATS", config.name))?;
 
         Ok(Self {
-            name: config.name.clone(),
-            endpoint: config.endpoint.clone(),
+            config: config.clone(),
             node_id: node_id.to_owned(),
-            prefix: config.subject_prefix.clone(),
             nats,
         })
     }
@@ -54,7 +62,7 @@ impl Tenant {
         let reply = self
             .nats
             .request(
-                subjects::ticket_resolve(&self.prefix),
+                subjects::ticket_resolve(&self.prefix()),
                 serde_json::to_vec(&request)?.into(),
             )
             .await?;
@@ -63,25 +71,25 @@ impl Tenant {
     }
 
     pub async fn publish(&self, event: &Event) {
-        self.publish_json(subjects::events(&self.prefix, &self.node_id), event)
+        self.publish_json(subjects::events(&self.prefix(), &self.node_id), event)
             .await;
     }
 
     pub async fn announce(&self, announce: &NodeAnnounce) {
-        self.publish_json(subjects::nodes_announce(&self.prefix), announce)
+        self.publish_json(subjects::nodes_announce(&self.prefix()), announce)
             .await;
     }
 
     pub async fn subscribe_discover(&self) -> anyhow::Result<async_nats::Subscriber> {
         Ok(self
             .nats
-            .subscribe(subjects::nodes_discover(&self.prefix))
+            .subscribe(subjects::nodes_discover(&self.prefix()))
             .await?)
     }
 
     pub async fn flush(&self) {
         if let Err(error) = self.nats.flush().await {
-            tracing::warn!(%error, tenant = %self.name, "failed to flush NATS");
+            tracing::warn!(%error, tenant = %self.name(), "failed to flush NATS");
         }
     }
 
@@ -89,13 +97,13 @@ impl Tenant {
         let payload = match serde_json::to_vec(value) {
             Ok(payload) => payload,
             Err(error) => {
-                tracing::warn!(%error, tenant = %self.name, "failed to serialize payload");
+                tracing::warn!(%error, tenant = %self.name(), "failed to serialize payload");
                 return;
             }
         };
 
         if let Err(error) = self.nats.publish(subject, payload.into()).await {
-            tracing::warn!(%error, tenant = %self.name, "failed to publish");
+            tracing::warn!(%error, tenant = %self.name(), "failed to publish");
         }
     }
 }
@@ -105,10 +113,10 @@ pub struct Tenants {
 }
 
 impl Tenants {
-    pub async fn connect(configs: &[TenantConfig], node_id: &str) -> anyhow::Result<Self> {
+    pub async fn connect(configs: &[Arc<TenantConfig>], node_id: &str) -> anyhow::Result<Self> {
         let mut by_host = HashMap::new();
         for config in configs {
-            let tenant = Tenant::connect(config, node_id).await?;
+            let tenant = Tenant::connect(config.clone(), node_id).await?;
             tracing::info!(tenant = %config.name, endpoint = %config.endpoint, "tenant configured");
 
             by_host.insert(config.host.clone(), Arc::new(tenant));

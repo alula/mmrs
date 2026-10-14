@@ -33,6 +33,19 @@ pub async fn handler(
     Query(query): Query<VersionQuery>,
     headers: HeaderMap,
 ) -> Response {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let tenant = state.tenants.by_host(host);
+    let tenant = match tenant {
+        Some(tenant) => tenant,
+        None => {
+            return (StatusCode::BAD_GATEWAY, "unknown tenant").into_response();
+        }
+    };
+
     let requested = match query.v.as_deref().map(str::parse::<u8>) {
         None => 1,
         Some(Ok(v)) => v,
@@ -41,29 +54,16 @@ pub async fn handler(
         }
     };
 
-    if requested < state.config.min_gateway_version {
+    if requested < tenant.config.min_gateway_version {
         return (StatusCode::BAD_REQUEST, "gateway version too old").into_response();
     }
 
-    let host = headers
-        .get(header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
-    let tenant = state.tenants.by_host(host);
+    ws.on_upgrade(move |socket| async move {
+        let version = requested.min(MAX_VERSION);
 
-    ws.on_upgrade(move |mut socket| async move {
-        match tenant {
-            Some(tenant) => {
-                let version = requested.min(MAX_VERSION);
-
-                Connection::new(socket, state, tenant, version, client_addr)
-                    .run()
-                    .await;
-            }
-            None => {
-                let _ = socket.send(close_message(CloseCode::ServerNotFound)).await;
-            }
-        }
+        Connection::new(socket, state, tenant, version, client_addr)
+            .run()
+            .await;
     })
 }
 

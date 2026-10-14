@@ -1,6 +1,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use anyhow::{Context, bail};
 
@@ -14,11 +15,13 @@ pub struct Config {
     pub media_ipv6: Option<Ipv6Addr>,
     pub media_port: u16,
     pub enable_ipv6: bool,
+    pub enable_dave: bool,
+    pub require_dave: bool,
     pub min_gateway_version: u8,
     pub encryption_modes: Vec<EncryptionMode>,
     pub region: Option<String>,
     pub capacity: Option<u32>,
-    pub tenants: Vec<TenantConfig>,
+    pub tenants: Vec<Arc<TenantConfig>>,
 }
 
 pub struct TlsConfig {
@@ -34,6 +37,8 @@ pub struct TenantConfig {
     pub nats_url: String,
     pub nats_creds: Option<PathBuf>,
     pub subject_prefix: String,
+    pub require_dave: bool,
+    pub min_gateway_version: u8,
 }
 
 impl Config {
@@ -48,18 +53,12 @@ impl Config {
             bail!("ENCRYPTION_MODES is empty");
         }
 
-        let tenants = list(&required("TENANTS")?)
-            .map(TenantConfig::from_env)
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        if tenants.is_empty() {
-            bail!("TENANTS is empty");
-        }
-        for (i, tenant) in tenants.iter().enumerate() {
-            if tenants[..i].iter().any(|other| other.host == tenant.host) {
-                bail!("tenants share the host {}", tenant.host);
-            }
-        }
+        let enable_dave = parse_or("ENABLE_DAVE", true)?;
+        let require_dave = parse_or("REQUIRE_DAVE", false)?;
 
+        if require_dave && !enable_dave {
+            bail!("cannot enforce DAVE when it's not enabled");
+        }
         let tls = match (optional("TLS_CERT"), optional("TLS_KEY")) {
             (Some(cert), Some(key)) => Some(TlsConfig {
                 cert: cert.into(),
@@ -69,7 +68,7 @@ impl Config {
             _ => bail!("TLS_CERT and TLS_KEY must be set together"),
         };
 
-        Ok(Self {
+        let mut config = Self {
             node_id: required("NODE_ID")?,
             voice_bind: parse_or("VOICE_BIND", SocketAddr::from(([0, 0, 0, 0], 8080)))?,
             tls,
@@ -77,20 +76,41 @@ impl Config {
             media_ipv6: parse("MEDIA_IPV6")?,
             media_port: parse_or("MEDIA_PORT", 50000)?,
             enable_ipv6: parse_or("ENABLE_IPV6", true)?,
+            enable_dave: parse_or("ENABLE_DAVE", true)?,
+            require_dave: parse_or("REQUIRE_DAVE", false)?,
             min_gateway_version: parse_or("MIN_GATEWAY_VERSION", 1)?,
             encryption_modes,
             region: optional("REGION"),
             capacity: parse("CAPACITY")?,
-            tenants,
-        })
+            tenants: Vec::new(),
+        };
+
+        let tenants = list(&required("TENANTS")?)
+            .map(|name| TenantConfig::from_env(&config, name))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+
+        if tenants.is_empty() {
+            bail!("no tenants configured");
+        }
+
+        for (i, tenant) in tenants.iter().enumerate() {
+            if tenants[..i].iter().any(|other| other.host == tenant.host) {
+                bail!("tenants share the host {}", tenant.host);
+            }
+        }
+
+        config.tenants = tenants;
+
+        Ok(config)
     }
 }
 
 impl TenantConfig {
-    fn from_env(name: &str) -> anyhow::Result<Self> {
+    fn from_env(base_config: &Config, name: &str) -> anyhow::Result<Arc<Self>> {
         let var = |suffix: &str| format!("TENANT_{}_{suffix}", name.to_ascii_uppercase());
         let endpoint = required(&var("ENDPOINT"))?.to_ascii_lowercase();
-        Ok(Self {
+
+        Ok(Arc::new(Self {
             name: name.to_owned(),
             host: strip_port(&endpoint).to_owned(),
             endpoint,
@@ -98,7 +118,14 @@ impl TenantConfig {
             nats_creds: optional(&var("NATS_CREDS")).map(PathBuf::from),
             subject_prefix: optional(&var("SUBJECT_PREFIX"))
                 .unwrap_or_else(|| mmrs_protocol::subjects::DEFAULT_PREFIX.to_owned()),
-        })
+            // todo: invalid values should probably explicitly bail out
+            require_dave: optional(&var("REQUIRE_DAVE"))
+                .map(|v| v.parse().unwrap_or(base_config.require_dave))
+                .unwrap_or(base_config.require_dave),
+            min_gateway_version: optional(&var("MIN_GATEWAY_VERSION"))
+                .map(|v| v.parse().unwrap_or(base_config.min_gateway_version))
+                .unwrap_or(base_config.min_gateway_version),
+        }))
     }
 }
 

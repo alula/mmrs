@@ -52,6 +52,7 @@ pub struct Session {
     leg: Leg,
     transport: Option<Transport>,
     replay: Replay,
+    max_dave_version: u8,
 }
 
 enum Signal {
@@ -280,7 +281,7 @@ impl Connection {
             Ok(TicketResponse::Granted(ticket)) => ticket,
             Ok(TicketResponse::Denied) => return Err(auth_failed()),
             Err(error) => {
-                tracing::warn!(%error, tenant = %self.tenant.name, "ticket resolve failed");
+                tracing::warn!(%error, tenant = %self.tenant.name(), "ticket resolve failed");
                 return Err(End::protocol(CloseCode::ServerCrash));
             }
         };
@@ -305,17 +306,17 @@ impl Connection {
         }
 
         let key = SessionKey {
-            tenant: self.tenant.name.clone(),
+            tenant: self.tenant.name().clone(),
             user_id: ticket.user_id.clone(),
             session_id: ticket.session_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
         let parked = self.state.parking.take(&ParkKey {
-            tenant: self.tenant.name.clone(),
+            tenant: self.tenant.name().clone(),
             session_id: ticket.session_id.clone(),
         });
         let room = RoomKey {
-            tenant: self.tenant.name.clone(),
+            tenant: self.tenant.name().clone(),
             room: ticket.room.clone(),
         };
         let leg = self
@@ -351,6 +352,7 @@ impl Connection {
             leg,
             transport: None,
             replay: Replay::default(),
+            max_dave_version: 0,
         });
 
         self.send(opcode::READY, ready).await?;
@@ -366,7 +368,7 @@ impl Connection {
 
     async fn resume(&mut self, resume: Resume) -> Result<(), End> {
         let key = ParkKey {
-            tenant: self.tenant.name.clone(),
+            tenant: self.tenant.name().clone(),
             session_id: resume.session_id,
         };
         let session = self

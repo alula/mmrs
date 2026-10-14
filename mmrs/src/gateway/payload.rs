@@ -43,6 +43,8 @@ pub struct Identify {
     pub channel_id: Option<String>,
     #[serde(default)]
     pub streams: Vec<StreamRequest>,
+    #[serde(default)]
+    pub max_dave_protocol_version: u8,
 }
 
 #[derive(Deserialize)]

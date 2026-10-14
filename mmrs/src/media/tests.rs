@@ -34,6 +34,8 @@ fn config() -> Config {
         media_ipv6: None,
         media_port: 0,
         enable_ipv6: false,
+        enable_dave: true,
+        require_dave: false,
         min_gateway_version: 1,
         encryption_modes: EncryptionMode::DEFAULT.to_vec(),
         region: None,

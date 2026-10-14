@@ -44,7 +44,7 @@ impl Parking {
         reason: EndReason,
     ) {
         let key = ParkKey {
-            tenant: tenant.name.clone(),
+            tenant: tenant.name().clone(),
             session_id: session.info.session_id.clone(),
         };
         let generation = state
