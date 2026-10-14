@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -14,6 +15,41 @@ pub struct RoomKey {
 pub struct Speaking {
     pub ssrc: u32,
     pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Video {
+    pub audio_ssrc: u32,
+    pub video_ssrc: u32,
+    pub rtx_ssrc: u32,
+    pub streams: Vec<VideoStream>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VideoStream {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub rid: String,
+    pub ssrc: u32,
+    pub rtx_ssrc: u32,
+    pub active: bool,
+    pub quality: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_bitrate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_framerate: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_resolution: Option<Resolution>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resolution {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub width: u32,
+    #[serde(default)]
+    pub height: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]

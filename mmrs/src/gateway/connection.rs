@@ -50,9 +50,17 @@ pub struct Session {
     membership: Membership,
     pushes: mpsc::UnboundedReceiver<Push>,
     leg: Leg,
+    layers: Vec<Layer>,
     transport: Option<Transport>,
     replay: Replay,
     max_dave_version: u8,
+}
+
+/// A video layer as assigned in READY.
+struct Layer {
+    rid: String,
+    ssrc: u32,
+    quality: u8,
 }
 
 enum Signal {
@@ -239,6 +247,9 @@ impl Connection {
                 }
                 Ok(())
             }
+            opcode::VIDEO => {
+                Ok(())
+            }
             opcode::MEDIA_SINK_WANTS => {
                 let wants: payload::MediaSinkWants = decode(frame.d)?;
                 if let Some(session) = &self.session {
@@ -324,6 +335,15 @@ impl Connection {
             .media
             .open_leg(room.clone(), 1 + 2 * identify.streams.len() as u32);
         let ready = self.ready(leg.first_ssrc(), identify.streams);
+        let layers = ready
+            .streams
+            .iter()
+            .map(|stream| Layer {
+                rid: stream.rid.clone(),
+                ssrc: stream.ssrc,
+                quality: stream.quality,
+            })
+            .collect();
         let (membership, pushes) =
             self.state
                 .rooms
@@ -350,6 +370,7 @@ impl Connection {
             membership,
             pushes,
             leg,
+            layers,
             transport: None,
             replay: Replay::default(),
             max_dave_version: 0,

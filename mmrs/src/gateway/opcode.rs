@@ -9,6 +9,7 @@ pub const RESUME: u32 = 7;
 pub const HELLO: u32 = 8;
 pub const RESUMED: u32 = 9;
 pub const CLIENTS_CONNECT: u32 = 11;
+pub const VIDEO: u32 = 12;
 pub const CLIENT_DISCONNECT: u32 = 13;
 pub const MEDIA_SINK_WANTS: u32 = 15;
 pub const VOICE_BACKEND_VERSION: u32 = 16;
@@ -18,6 +19,12 @@ pub const PLATFORM: u32 = 20;
 pub fn is_sequenced(op: u32) -> bool {
     matches!(
         op,
-        SPEAKING | CLIENTS_CONNECT | CLIENT_DISCONNECT | MEDIA_SINK_WANTS | CLIENT_FLAGS | PLATFORM
+        SPEAKING
+            | CLIENTS_CONNECT
+            | VIDEO
+            | CLIENT_DISCONNECT
+            | MEDIA_SINK_WANTS
+            | CLIENT_FLAGS
+            | PLATFORM
     )
 }

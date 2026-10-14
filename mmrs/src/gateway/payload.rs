@@ -1,9 +1,11 @@
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::encryption::EncryptionMode;
+use crate::room::{Resolution, VideoStream};
 
 #[derive(Deserialize)]
 pub struct Frame {
@@ -182,6 +184,36 @@ pub struct Speaking<'a> {
     pub speaking: SpeakingState,
 }
 
+#[derive(Deserialize)]
+pub struct ClientVideo {
+    /// Sent as 0 when every layer is off.
+    #[serde(default, deserialize_with = "nonzero")]
+    pub video_ssrc: Option<NonZeroU32>,
+    #[serde(default)]
+    pub streams: Vec<ClientVideoStream>,
+}
+
+#[derive(Deserialize)]
+pub struct ClientVideoStream {
+    #[serde(rename = "type")]
+    pub kind: Option<String>,
+    pub rid: Option<String>,
+    pub active: Option<bool>,
+    pub quality: Option<u8>,
+    pub max_bitrate: Option<u32>,
+    pub max_framerate: Option<u32>,
+    pub max_resolution: Option<Resolution>,
+}
+
+#[derive(Serialize)]
+pub struct Video<'a> {
+    pub user_id: &'a str,
+    pub audio_ssrc: u32,
+    pub video_ssrc: u32,
+    pub rtx_ssrc: u32,
+    pub streams: &'a [VideoStream],
+}
+
 #[derive(Serialize)]
 pub struct ClientsConnect<'a> {
     pub user_ids: Vec<&'a str>,
@@ -227,6 +259,10 @@ fn id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
 
 fn optional_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
     return Ok(Option::<RawId>::deserialize(deserializer)?.map(String::from));
+}
+
+fn nonzero<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<NonZeroU32>, D::Error> {
+    return Ok(NonZeroU32::new(u32::deserialize(deserializer)?));
 }
 
 #[cfg(test)]
