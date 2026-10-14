@@ -235,10 +235,31 @@ mod tests {
         };
     }
 
-    fn peer(user_id: &str, speaking: Option<Speaking>) -> Peer {
+    fn peer(user_id: &str, speaking: Option<Speaking>, video: Option<Video>) -> Peer {
         return Peer {
             user_id: user_id.into(),
             speaking,
+            video,
+        };
+    }
+
+    fn video(active: bool) -> Video {
+        let (video_ssrc, rtx_ssrc) = if active { (11, 12) } else { (0, 0) };
+        return Video {
+            audio_ssrc: 10,
+            video_ssrc,
+            rtx_ssrc,
+            streams: vec![VideoStream {
+                kind: "video".into(),
+                rid: "100".into(),
+                ssrc: 11,
+                rtx_ssrc: 12,
+                active,
+                quality: 100,
+                max_bitrate: Some(2_500_000),
+                max_framerate: Some(30),
+                max_resolution: None,
+            }],
         };
     }
 
@@ -252,11 +273,11 @@ mod tests {
         let (b, mut b_rx) = rooms.join(key(), 2, "b".into());
         assert_eq!(
             b_rx.try_recv().unwrap(),
-            Push::Connected(vec![peer("a", Some(speaking))])
+            Push::Connected(vec![peer("a", Some(speaking), None)])
         );
         assert_eq!(
             a_rx.try_recv().unwrap(),
-            Push::Connected(vec![peer("b", None)])
+            Push::Connected(vec![peer("b", None, None)])
         );
 
         drop(b);
@@ -280,15 +301,46 @@ mod tests {
 
         assert_eq!(
             new_rx.try_recv().unwrap(),
-            Push::Connected(vec![peer("a", None)])
+            Push::Connected(vec![peer("a", None, None)])
         );
         assert_eq!(
             a_rx.try_recv().unwrap(),
-            Push::Connected(vec![peer("b", None)])
+            Push::Connected(vec![peer("b", None, None)])
         );
         assert!(a_rx.try_recv().is_err());
 
         drop(old);
         assert!(a_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn video_pushed_and_replayed() {
+        let rooms = Arc::new(Rooms::default());
+        let (a, mut a_rx) = rooms.join(key(), 1, "a".into());
+        let (_b, mut b_rx) = rooms.join(key(), 2, "b".into());
+        a_rx.try_recv().unwrap();
+        b_rx.try_recv().unwrap();
+
+        a.set_video(video(true));
+        assert_eq!(
+            b_rx.try_recv().unwrap(),
+            Push::Video {
+                user_id: "a".into(),
+                video: video(true),
+            }
+        );
+        assert!(a_rx.try_recv().is_err());
+
+        a.set_video(video(false));
+        b_rx.try_recv().unwrap();
+
+        let (_c, mut c_rx) = rooms.join(key(), 3, "c".into());
+        assert_eq!(
+            c_rx.try_recv().unwrap(),
+            Push::Connected(vec![
+                peer("a", None, Some(video(false))),
+                peer("b", None, None),
+            ])
+        );
     }
 }

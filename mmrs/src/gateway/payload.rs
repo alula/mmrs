@@ -283,4 +283,73 @@ mod tests {
         assert_eq!(identify.channel_id, None);
         assert!(identify.streams.is_empty());
     }
+
+    #[test]
+    fn video_from_native() {
+        let video: ClientVideo = serde_json::from_value(serde_json::json!({
+            "audio_ssrc": 21562,
+            "video_ssrc": 21563,
+            "rtx_ssrc": 21564,
+            "streams": [
+                {"type": "video", "rid": "50", "ssrc": 21563, "active": true, "quality": 50,
+                 "rtx_ssrc": 21564, "max_bitrate": 2500000, "max_framerate": 20,
+                 "max_resolution": {"type": "fixed", "width": 1280, "height": 720}},
+                {"type": "video", "rid": "100", "ssrc": 21565, "active": true, "quality": 100,
+                 "rtx_ssrc": 21566, "max_bitrate": 2500000, "max_framerate": 20,
+                 "max_resolution": {"type": "fixed", "width": 1280, "height": 720}},
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(video.video_ssrc, NonZeroU32::new(21563));
+        assert_eq!(video.streams.len(), 2);
+        let low = &video.streams[0];
+        assert_eq!(low.kind.as_deref(), Some("video"));
+        assert_eq!(low.rid.as_deref(), Some("50"));
+        assert_eq!(low.active, Some(true));
+        assert_eq!(low.quality, Some(50));
+        assert_eq!(low.max_bitrate, Some(2_500_000));
+        assert_eq!(low.max_framerate, Some(20));
+        assert_eq!(
+            low.max_resolution,
+            Some(Resolution {
+                kind: "fixed".into(),
+                width: 1280,
+                height: 720,
+            })
+        );
+    }
+
+    #[test]
+    fn video_from_browser() {
+        let video: ClientVideo = serde_json::from_value(serde_json::json!({
+            "audio_ssrc": 0,
+            "video_ssrc": 0,
+            "rtx_ssrc": 0,
+            "streams": [
+                {"type": "video", "rid": "100", "ssrc": 44177483, "rtx_ssrc": 2445231536u32,
+                 "active": false, "quality": 100, "max_bitrate": 2500000, "max_framerate": 20,
+                 "max_resolution": {"type": "fixed", "width": 1280, "height": 720}},
+            ],
+        }))
+        .unwrap();
+
+        assert_eq!(video.video_ssrc, None);
+        assert_eq!(video.streams.len(), 1);
+        assert_eq!(video.streams[0].rid.as_deref(), Some("100"));
+        assert_eq!(video.streams[0].active, Some(false));
+    }
+
+    #[test]
+    fn video_without_streams() {
+        let video: ClientVideo = serde_json::from_value(serde_json::json!({
+            "audio_ssrc": 1234,
+            "video_ssrc": 0,
+            "rtx_ssrc": 0,
+        }))
+        .unwrap();
+
+        assert_eq!(video.video_ssrc, None);
+        assert!(video.streams.is_empty());
+    }
 }

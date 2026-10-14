@@ -764,7 +764,8 @@ fn heartbeat_ack(version: u8, d: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{heartbeat_ack, sink_wants};
+    use super::{Layer, heartbeat_ack, sink_wants, video};
+    use crate::room::Resolution;
     use serde_json::json;
 
     #[test]
@@ -796,5 +797,99 @@ mod tests {
             heartbeat_ack(5, json!("1730000000000")),
             json!("1730000000000")
         );
+    }
+
+    fn layers() -> Vec<Layer> {
+        return vec![
+            Layer {
+                rid: "50".into(),
+                ssrc: 21563,
+                quality: 50,
+            },
+            Layer {
+                rid: "100".into(),
+                ssrc: 21565,
+                quality: 100,
+            },
+        ];
+    }
+
+    #[test]
+    fn video_announces_leg_ssrcs() {
+        let client = serde_json::from_value(json!({
+            "audio_ssrc": 0,
+            "video_ssrc": 44177483,
+            "rtx_ssrc": 2445231536u32,
+            "streams": [
+                {"type": "video", "rid": "100", "ssrc": 44177483, "rtx_ssrc": 2445231536u32,
+                 "active": true, "quality": 100, "max_bitrate": 2500000, "max_framerate": 20,
+                 "max_resolution": {"type": "fixed", "width": 1280, "height": 720}},
+                {"type": "video", "rid": "25", "ssrc": 5, "rtx_ssrc": 6, "active": true},
+            ],
+        }))
+        .unwrap();
+        let video = video(21562, &layers(), &client);
+
+        assert_eq!(video.audio_ssrc, 21562);
+        assert_eq!(video.video_ssrc, 21565);
+        assert_eq!(video.rtx_ssrc, 21566);
+        assert_eq!(video.streams.len(), 1);
+        let stream = &video.streams[0];
+        assert_eq!(stream.rid, "100");
+        assert_eq!((stream.ssrc, stream.rtx_ssrc), (21565, 21566));
+        assert!(stream.active);
+        assert_eq!(stream.quality, 100);
+        assert_eq!(stream.max_bitrate, Some(2_500_000));
+        assert_eq!(stream.max_framerate, Some(20));
+        assert_eq!(
+            stream.max_resolution,
+            Some(Resolution {
+                kind: "fixed".into(),
+                width: 1280,
+                height: 720,
+            })
+        );
+    }
+
+    #[test]
+    fn video_top_level_is_lowest_active_layer() {
+        let client = serde_json::from_value(json!({
+            "video_ssrc": 21563,
+            "streams": [
+                {"rid": "100", "active": true},
+                {"rid": "50", "active": true},
+            ],
+        }))
+        .unwrap();
+        let video = video(21562, &layers(), &client);
+
+        assert_eq!((video.video_ssrc, video.rtx_ssrc), (21563, 21564));
+        let rids: Vec<&str> = video
+            .streams
+            .iter()
+            .map(|stream| stream.rid.as_str())
+            .collect();
+        assert_eq!(rids, ["50", "100"]);
+        assert_eq!(video.streams[0].kind, "video");
+        assert_eq!(video.streams[0].quality, 50);
+    }
+
+    #[test]
+    fn video_ssrc_zero_turns_layers_off() {
+        let client = serde_json::from_value(json!({
+            "audio_ssrc": 0,
+            "video_ssrc": 0,
+            "rtx_ssrc": 0,
+            "streams": [
+                {"type": "video", "rid": "50", "ssrc": 1, "rtx_ssrc": 2, "active": true},
+                {"type": "video", "rid": "100", "ssrc": 3, "rtx_ssrc": 4, "active": true},
+            ],
+        }))
+        .unwrap();
+        let video = video(21562, &layers(), &client);
+
+        assert_eq!((video.video_ssrc, video.rtx_ssrc), (0, 0));
+        assert!(video.streams.iter().all(|stream| !stream.active));
+        assert_eq!(video.streams[1].ssrc, 21565);
     }
 }
