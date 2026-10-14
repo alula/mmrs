@@ -60,6 +60,7 @@ async fn main() -> anyhow::Result<()> {
     let media = Media::bind(&config).await?;
     tokio::spawn(media.clone().run());
     tokio::spawn(media.clone().report());
+    tokio::spawn(media.clone().tick());
 
     let tenants = Tenants::connect(&config.tenants, &config.node_id).await?;
     let bind = config.voice_bind;

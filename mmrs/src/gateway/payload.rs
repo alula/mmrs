@@ -169,8 +169,6 @@ impl SpeakingState {
 #[derive(Deserialize)]
 pub struct ClientSpeaking {
     pub speaking: SpeakingState,
-    #[serde(default)]
-    pub ssrc: u32,
 }
 
 #[derive(Serialize)]

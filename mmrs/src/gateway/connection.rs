@@ -18,7 +18,7 @@ use super::resume::{ParkKey, Parking, Replay};
 use super::{close_message, opcode};
 use crate::AppState;
 use crate::encryption::EncryptionMode;
-use crate::media::{IceLease, Leg, SinkWants};
+use crate::media::{Leg, Offer, SinkWants};
 use crate::room::{Membership, Push, RoomKey, Speaking};
 use crate::session::SessionKey;
 use crate::tenant::Tenant;
@@ -59,7 +59,7 @@ enum Signal {
 
 enum Transport {
     Udp,
-    WebRtc { _ice: IceLease },
+    WebRtc,
 }
 
 struct End {
@@ -231,8 +231,10 @@ impl Connection {
                 let speaking: ClientSpeaking = serde_json::from_value(frame.d)
                     .map_err(|_| End::protocol(CloseCode::DecodeError))?;
                 if let Some(session) = &self.session {
+                    // Browsers name their own SSRC; MMRS forwards every
+                    // client's audio from the leg's.
                     session.membership.set_speaking(Speaking {
-                        ssrc: speaking.ssrc,
+                        ssrc: session.leg.first_ssrc(),
                         flags: speaking.speaking.flags(),
                     });
                 }
@@ -448,7 +450,7 @@ impl Connection {
 
         let transport = match select.protocol.as_str() {
             "udp" => self.select_transport_udp(select, &mut description)?,
-            "webrtc" => self.select_transport_webrtc(&mut description)?,
+            "webrtc" => self.select_transport_webrtc(select, &mut description)?,
             _ => return Err(End::protocol(CloseCode::UnknownProtocol)),
         };
         if let Some(session) = &mut self.session {
@@ -488,13 +490,26 @@ impl Connection {
 
     fn select_transport_webrtc(
         &self,
+        select: SelectProtocol,
         description: &mut payload::SessionDescription,
     ) -> Result<Transport, End> {
-        let ice = self.state.media.lease_ice();
+        let offer = select
+            .data
+            .as_str()
+            .and_then(Offer::parse)
+            .ok_or_else(|| End::protocol(CloseCode::DecodeError))?;
 
-        description.sdp = Some(ice.sdp_answer(self.state.media.ip_for(self.client_addr)));
+        let Some(session) = &self.session else {
+            return Err(End::protocol(CloseCode::NotAuthenticated));
+        };
+        let ip = self.state.media.ip_for(self.client_addr);
+        let sdp = session.leg.select_webrtc(offer, ip).map_err(|error| {
+            tracing::warn!(%error, "webrtc setup failed");
+            End::protocol(CloseCode::ServerCrash)
+        })?;
+        description.sdp = Some(sdp);
 
-        return Ok(Transport::WebRtc { _ice: ice });
+        return Ok(Transport::WebRtc);
     }
 
     async fn push(&mut self, push: Push) -> Result<(), End> {
