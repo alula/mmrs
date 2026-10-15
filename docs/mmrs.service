@@ -1,0 +1,34 @@
+[Unit]
+Description=Mooncord Media Relay Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/mmrs
+EnvironmentFile=/etc/mmrs/mmrs.env
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+
+DynamicUser=yes
+# Directory holding NATS .creds and TLS files referenced by the configuration.
+ConfigurationDirectory=mmrs
+WorkingDirectory=/etc/mmrs
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

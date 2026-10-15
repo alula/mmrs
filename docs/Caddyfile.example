@@ -1,0 +1,9 @@
+{
+	email admin@example.com
+}
+
+# One site address per tenant, matching TENANT_<NAME>_ENDPOINT. The Host header
+# is passed through unchanged and selects the tenant.
+mooncord.voice.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
