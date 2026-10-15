@@ -87,6 +87,9 @@ struct LegState {
     payload_types: Vec<PayloadTypes>,
     /// What MMRS received on the leg's media SSRCs, for receiver reports.
     received: BTreeMap<u32, ReceiveStats>,
+    /// Whether media it sends is forwarded. A receive-only leg (a stream
+    /// viewer) still sends RTCP, so its NACKs and PLIs reach the sender.
+    publish: bool,
 }
 
 impl LegState {
@@ -350,6 +353,9 @@ impl Media {
         };
         let now = Instant::now();
         let sender = by_id.get_mut(&sender_id).expect("indexed leg exists");
+        if !sender.publish {
+            return;
+        }
         sender.record_rtp(ssrc, &plain, now);
         let kind = if ssrc == sender.ssrcs.start {
             ForwardKind::Audio
@@ -439,7 +445,7 @@ impl Media {
     fn forward_browser_rtp(&self, legs: &mut Legs, mut received: Vec<(u64, RtpPacket)>) {
         let Legs { by_id, rooms, .. } = legs;
         while let Some((sender_id, packet)) = received.pop() {
-            let Some(sender) = by_id.get(&sender_id) else {
+            let Some(sender) = by_id.get(&sender_id).filter(|sender| sender.publish) else {
                 continue;
             };
             let ssrc = sender.ssrcs.start;
@@ -664,7 +670,13 @@ impl Media {
 
     /// Allocates `count` consecutive SSRCs, none of them 0, for a client in
     /// `room`.
-    pub fn open_leg(self: &Arc<Self>, room: RoomKey, user_id: u64, count: u32) -> Leg {
+    pub fn open_leg(
+        self: &Arc<Self>,
+        room: RoomKey,
+        user_id: u64,
+        count: u32,
+        publish: bool,
+    ) -> Leg {
         let first = allocate(&self.next_ssrc, count);
         let ssrcs = first..first + count;
 
@@ -686,6 +698,7 @@ impl Media {
                 video: Vec::new(),
                 payload_types: Vec::new(),
                 received: BTreeMap::new(),
+                publish,
             },
         );
         self.send_video_receivers(&mut legs, &room);

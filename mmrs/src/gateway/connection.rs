@@ -54,6 +54,8 @@ pub struct Session {
     transport: Option<Transport>,
     replay: Replay,
     max_dave_version: u8,
+    /// See [`mmrs_protocol::Ticket::can_publish`].
+    can_publish: bool,
 }
 
 /// A video layer as assigned in READY.
@@ -237,7 +239,7 @@ impl Connection {
             }
             opcode::SPEAKING => {
                 let speaking: ClientSpeaking = decode(frame.d)?;
-                if let Some(session) = &self.session {
+                if let Some(session) = self.session.as_ref().filter(|session| session.can_publish) {
                     // Browsers name their own SSRC; MMRS forwards every
                     // client's audio from the leg's.
                     session.membership.set_speaking(Speaking {
@@ -249,7 +251,7 @@ impl Connection {
             }
             opcode::VIDEO => {
                 let client: ClientVideo = decode(frame.d)?;
-                if let Some(session) = &self.session {
+                if let Some(session) = self.session.as_ref().filter(|session| session.can_publish) {
                     let video = video(session.leg.first_ssrc(), &session.layers, &client);
                     let layers = if video.streams.iter().any(|stream| stream.active) {
                         video.streams.iter().map(|stream| stream.ssrc).collect()
@@ -332,18 +334,23 @@ impl Connection {
             tenant: self.tenant.name().clone(),
             user_id: ticket.user_id.clone(),
             session_id: ticket.session_id.clone(),
+            server_id: ticket.server_id.clone(),
         };
         let registration = self.state.sessions.register(key.clone());
         let parked = self.state.parking.take(&ParkKey {
             tenant: self.tenant.name().clone(),
             session_id: ticket.session_id.clone(),
+            server_id: ticket.server_id.clone(),
         });
         let room = RoomKey {
             tenant: self.tenant.name().clone(),
             room: ticket.room.clone(),
         };
         let count = 1 + 2 * identify.streams.len() as u32;
-        let leg = self.state.media.open_leg(room.clone(), user_id, count);
+        let leg = self
+            .state
+            .media
+            .open_leg(room.clone(), user_id, count, ticket.can_publish);
         let ready = self.ready(leg.first_ssrc(), identify.streams);
         let layers = ready
             .streams
@@ -384,6 +391,7 @@ impl Connection {
             transport: None,
             replay: Replay::default(),
             max_dave_version: 0,
+            can_publish: ticket.can_publish,
         });
 
         self.send(opcode::READY, ready).await?;
@@ -401,6 +409,7 @@ impl Connection {
         let key = ParkKey {
             tenant: self.tenant.name().clone(),
             session_id: resume.session_id,
+            server_id: resume.server_id.clone(),
         };
         let session = self
             .state
@@ -462,7 +471,14 @@ impl Connection {
             return Err(End::protocol(CloseCode::NotAuthenticated));
         };
 
-        let (video_codecs, payload_types) = client_codecs(&select.codecs);
+        let (mut video_codecs, payload_types) = client_codecs(&select.codecs);
+        // A member that never sends only has to decode the room's codec, so
+        // what it can encode mustn't narrow the choice.
+        if !session.can_publish {
+            for support in &mut video_codecs {
+                support.encode = true;
+            }
+        }
         session.leg.set_payload_types(payload_types);
 
         let video_codec = session.membership.set_video_codecs(video_codecs);

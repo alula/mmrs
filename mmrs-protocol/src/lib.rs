@@ -89,6 +89,14 @@ pub struct Ticket {
     pub channel_id: Option<String>,
     /// Opaque room key chosen by the tenant, e.g. `g/<guild>/c/<channel>`.
     pub room: String,
+    /// Whether the session may send media. False for a stream viewer, which
+    /// only receives. Tenants that predate this always publish.
+    #[serde(default = "default_can_publish")]
+    pub can_publish: bool,
+}
+
+fn default_can_publish() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,15 +190,30 @@ mod tests {
             server_id: "2".into(),
             channel_id: None,
             room: "g/2/c/3".into(),
+            can_publish: true,
         }))
         .unwrap();
         assert_eq!(
             json,
             serde_json::json!({
                 "type": "granted", "user_id": "1", "session_id": "s",
-                "server_id": "2", "channel_id": null, "room": "g/2/c/3"
+                "server_id": "2", "channel_id": null, "room": "g/2/c/3",
+                "can_publish": true
             })
         );
+        // Tenants from before `can_publish` always publish.
+        let old: TicketResponse = serde_json::from_value(serde_json::json!({
+            "type": "granted", "user_id": "1", "session_id": "s",
+            "server_id": "2", "channel_id": null, "room": "g/2/c/3"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            TicketResponse::Granted(Ticket {
+                can_publish: true,
+                ..
+            })
+        ));
         assert_eq!(
             serde_json::to_value(TicketResponse::Denied).unwrap(),
             serde_json::json!({"type": "denied"})

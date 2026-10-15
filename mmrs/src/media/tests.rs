@@ -64,6 +64,12 @@ struct Client {
 /// A running media plane with `count` UDP clients in one room, past IP
 /// discovery.
 async fn clients(count: usize) -> (Arc<Media>, Vec<Client>) {
+    clients_publishing(&vec![true; count]).await
+}
+
+/// Like [`clients`], with one client per entry, publishing or receive-only.
+async fn clients_publishing(publish: &[bool]) -> (Arc<Media>, Vec<Client>) {
+    let count = publish.len();
     let media = Media::bind(&config()).await.unwrap();
     let port = media.socket.local_addr().unwrap().port();
     tokio::spawn(media.clone().run());
@@ -75,7 +81,7 @@ async fn clients(count: usize) -> (Arc<Media>, Vec<Client>) {
     let mode = EncryptionMode::AeadAes256GcmRtpsize;
     let mut clients = Vec::new();
     for user_id in 1..=count as u64 {
-        let leg = media.open_leg(room.clone(), user_id, 3);
+        let leg = media.open_leg(room.clone(), user_id, 3, publish[user_id as usize - 1]);
         let cipher = Cipher::new(mode, &leg.select_udp(mode, None));
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         socket.connect((Ipv4Addr::LOCALHOST, port)).await.unwrap();
@@ -125,6 +131,37 @@ async fn forwards_rtp_between_udp_legs() {
     let forwarded = recv(&b.socket).await;
     assert_eq!(forwarded[forwarded.len() - 4..], [0, 0, 0, 0]);
     assert_eq!(b.cipher.open(&forwarded, 12).unwrap().as_slice(), rtp);
+}
+
+#[tokio::test]
+async fn drops_media_from_receive_only_legs() {
+    let (_media, clients) = clients_publishing(&[true, false]).await;
+    let [streamer, viewer] = &clients[..] else {
+        unreachable!()
+    };
+
+    let rtp = audio(viewer.leg.first_ssrc(), 1);
+    viewer
+        .socket
+        .send(&viewer.cipher.seal(&rtp, 12, 7).unwrap())
+        .await
+        .unwrap();
+    let mut buf = [0; MAX_PACKET];
+    let nothing = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        streamer.socket.recv(&mut buf),
+    )
+    .await;
+    assert!(nothing.is_err(), "a viewer's media must not reach the room");
+
+    let rtp = audio(streamer.leg.first_ssrc(), 1);
+    streamer
+        .socket
+        .send(&streamer.cipher.seal(&rtp, 12, 7).unwrap())
+        .await
+        .unwrap();
+    let forwarded = recv(&viewer.socket).await;
+    assert_eq!(viewer.cipher.open(&forwarded, 12).unwrap().as_slice(), rtp);
 }
 
 fn video(ssrc: u32, seq: u16, payload_type: u8, marker: bool) -> Vec<u8> {
@@ -355,7 +392,7 @@ async fn bridges_browser_and_native_audio() {
         tenant: "t".into(),
         room: "r".into(),
     };
-    let leg = media.open_leg(room, 9, 3);
+    let leg = media.open_leg(room, 9, 3, true);
     let (mut browser, fragment) = Browser::new().await;
     let sdp = leg
         .select_webrtc(Offer::parse(&fragment).unwrap(), Ipv4Addr::LOCALHOST.into())

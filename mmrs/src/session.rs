@@ -9,6 +9,9 @@ pub struct SessionKey {
     pub tenant: String,
     pub user_id: String,
     pub session_id: String,
+    /// A client holds one connection per server: its voice connection and a
+    /// Go Live stream share the user and session ids.
+    pub server_id: String,
 }
 
 struct Entry {
@@ -71,7 +74,19 @@ mod tests {
             tenant: "t".into(),
             user_id: "1".into(),
             session_id: "s".into(),
+            server_id: "v".into(),
         };
+    }
+
+    #[test]
+    fn stream_connection_does_not_replace_voice() {
+        let sessions = Sessions::default();
+        let mut voice = sessions.register(key());
+        let _stream = sessions.register(SessionKey {
+            server_id: "stream".into(),
+            ..key()
+        });
+        assert!(voice.replaced.try_recv().is_err());
     }
 
     #[test]

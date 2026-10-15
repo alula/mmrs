@@ -21,6 +21,8 @@ const MAX_UNACKED: usize = 1024;
 pub struct ParkKey {
     pub tenant: String,
     pub session_id: String,
+    /// See [`crate::session::SessionKey::server_id`].
+    pub server_id: String,
 }
 
 struct Parked {
@@ -46,6 +48,7 @@ impl Parking {
         let key = ParkKey {
             tenant: tenant.name().clone(),
             session_id: session.info.session_id.clone(),
+            server_id: session.info.server_id.clone(),
         };
         let generation = state
             .parking
