@@ -1,4 +1,4 @@
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -6,11 +6,13 @@ use std::sync::Arc;
 use anyhow::{Context, bail};
 
 use crate::encryption::EncryptionMode;
+use crate::proxy::TrustedProxies;
 
 pub struct Config {
     pub node_id: String,
     pub voice_bind: SocketAddr,
     pub tls: Option<TlsConfig>,
+    pub trusted_proxies: TrustedProxies,
     pub media_ipv4: Ipv4Addr,
     pub media_ipv6: Option<Ipv6Addr>,
     pub media_port: u16,
@@ -68,10 +70,26 @@ impl Config {
             _ => bail!("TLS_CERT and TLS_KEY must be set together"),
         };
 
+        let trusted_proxies = match optional("TRUSTED_PROXIES").as_deref() {
+            Some("all") => TrustedProxies::All,
+            Some(proxies) => {
+                let mut ips = Vec::new();
+                for entry in list(proxies) {
+                    let Ok(ip) = entry.parse::<IpAddr>() else {
+                        bail!("invalid TRUSTED_PROXIES entry {entry}");
+                    };
+                    ips.push(ip.to_canonical());
+                }
+                TrustedProxies::Only(ips)
+            }
+            None => TrustedProxies::Only(Vec::new()),
+        };
+
         let mut config = Self {
             node_id: required("NODE_ID")?,
             voice_bind: parse_or("VOICE_BIND", SocketAddr::from(([0, 0, 0, 0], 8080)))?,
             tls,
+            trusted_proxies,
             media_ipv4: parse("MEDIA_IPV4")?.context("MEDIA_IPV4 is required")?,
             media_ipv6: parse("MEDIA_IPV6")?,
             media_port: parse_or("MEDIA_PORT", 50000)?,

@@ -4,6 +4,7 @@ use str0m::rtp::{Extension, ExtensionValues, RtpWrite};
 use str0m::{Candidate, Event, Input, Output, Rtc};
 
 use super::*;
+use crate::proxy::TrustedProxies;
 
 #[test]
 fn sink_wants_default_to_any() {
@@ -30,6 +31,7 @@ fn config() -> Config {
         node_id: "n".into(),
         voice_bind: "127.0.0.1:0".parse().unwrap(),
         tls: None,
+        trusted_proxies: TrustedProxies::Only(Vec::new()),
         media_ipv4: Ipv4Addr::LOCALHOST,
         media_ipv6: None,
         media_port: 0,

@@ -4,6 +4,7 @@ mod encryption;
 mod gateway;
 mod media;
 mod mls;
+mod proxy;
 mod room;
 mod session;
 mod tenant;

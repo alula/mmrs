@@ -35,7 +35,7 @@ pub struct Connection {
     state: Arc<AppState>,
     tenant: Arc<Tenant>,
     version: u8,
-    client_addr: SocketAddr,
+    client_ip: IpAddr,
     session: Option<Session>,
 }
 
@@ -111,14 +111,14 @@ impl Connection {
         state: Arc<AppState>,
         tenant: Arc<Tenant>,
         version: u8,
-        client_addr: SocketAddr,
+        client_ip: IpAddr,
     ) -> Self {
         Self {
             socket,
             state,
             tenant,
             version,
-            client_addr,
+            client_ip,
             session: None,
         }
     }
@@ -440,7 +440,7 @@ impl Connection {
 
         return payload::Ready {
             ssrc,
-            ip: media.ip_for(self.client_addr).to_string(),
+            ip: media.ip_for(self.client_ip).to_string(),
             port: media.port(),
             modes: self.state.config.encryption_modes.clone(),
             streams,
@@ -537,7 +537,7 @@ impl Connection {
         let Some(session) = &self.session else {
             return Err(End::protocol(CloseCode::NotAuthenticated));
         };
-        let ip = self.state.media.ip_for(self.client_addr);
+        let ip = self.state.media.ip_for(self.client_ip);
         let sdp = session.leg.select_webrtc(offer, ip).map_err(|error| {
             tracing::warn!(%error, "webrtc setup failed");
             End::protocol(CloseCode::ServerCrash)

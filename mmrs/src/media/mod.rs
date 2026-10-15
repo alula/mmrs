@@ -255,8 +255,8 @@ impl Media {
     }
 
     /// The address to hand a client that reached the gateway from `client`.
-    pub fn ip_for(&self, client: SocketAddr) -> IpAddr {
-        match (self.ipv6, client.ip().to_canonical()) {
+    pub fn ip_for(&self, client: IpAddr) -> IpAddr {
+        match (self.ipv6, client.to_canonical()) {
             (Some(ipv6), IpAddr::V6(_)) => IpAddr::V6(ipv6),
             _ => IpAddr::V4(self.ipv4),
         }

@@ -58,10 +58,15 @@ pub async fn handler(
         return (StatusCode::BAD_REQUEST, "gateway version too old").into_response();
     }
 
+    let client_ip = state
+        .config
+        .trusted_proxies
+        .client_ip(client_addr.ip(), &headers);
+
     ws.on_upgrade(move |socket| async move {
         let version = requested.min(MAX_VERSION);
 
-        Connection::new(socket, state, tenant, version, client_addr)
+        Connection::new(socket, state, tenant, version, client_ip)
             .run()
             .await;
     })
